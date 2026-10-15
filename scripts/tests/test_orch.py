@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import shutil
@@ -431,3 +432,141 @@ def test_git_gets_tool_venv_first_on_path(env, monkeypatch):
     shutil.rmtree(ws / "_local" / "venv")
     orch.git(orch.Ctx(), ws, "--version")
     assert envs[-1]["PATH"] == os.environ["PATH"]
+
+
+def test_last_agent_message_both_formats():
+    old = json.dumps({"id": "0", "msg": {"type": "agent_message", "message": "旧"}})
+    new = json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "新"}})
+    assert orch.last_agent_message(old + "\n" + new + "\nnot json\n") == "新"
+    assert orch.last_agent_message("not json\n") is None
+
+
+def test_report_from_file_and_stdin(env, capsys, monkeypatch, tmp_path):
+    ws, fake, _ = env
+    dispatch(env)
+    rep = Path(tasks(ws)["ac3ds-re#5"]["worktree"]) / ".task" / "report.md"
+    src = tmp_path / "r.md"
+    src.write_bytes("# 報告\r\n\r\n結論: 試験\r\n".encode("utf-8"))
+    assert run("report", "5", "--from", str(src)) == 0
+    assert rep.read_bytes().decode("utf-8") == "（ワーカーの最終の返答をオーケストラが保存した）\n# 報告\n\n結論: 試験\n"
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO("標準入力の報告\n".encode("utf-8")), encoding="utf-8"))
+    assert run("report", "5", "--from", "-") == 0
+    assert "上書き" in capsys.readouterr().out
+    assert rep.read_bytes().decode("utf-8").endswith("標準入力の報告\n")
+
+
+def test_report_refused(env, tmp_path):
+    ws, fake, _ = env
+    dispatch(env)
+    rep = Path(tasks(ws)["ac3ds-re#5"]["worktree"]) / ".task" / "report.md"
+    src = tmp_path / "r.md"
+    src.write_text("連絡は " + FAKE_EMAIL + "\n", encoding="utf-8")
+    assert run("report", "5", "--from", str(src)) == 1  # GitHub へ出る本文の検査
+    assert not rep.exists()
+    src.write_text("本文\n", encoding="utf-8")
+    assert run("reject", "5", "--reason", "試験") == 0
+    assert run("report", "5", "--from", str(src)) == 1  # 却下後は保存しない
+    assert not rep.exists()
+
+
+class FakeCodex:
+    """orch.run_codex の代わり。起動せず、決めた結果を返す。"""
+
+    def __init__(self, out, err="", code=0):
+        self.out, self.err, self.code = out, err, code
+        self.calls = []
+
+    def __call__(self, c, cmd, cwd, prompt):
+        self.calls.append((list(cmd), Path(cwd), prompt))
+        return self.code, self.out, self.err
+
+
+def use_codex(monkeypatch, out, err="", code=0):
+    monkeypatch.setattr(orch, "find_codex", lambda: "codex")
+    fc = FakeCodex(out, err, code)
+    monkeypatch.setattr(orch, "run_codex", fc)
+    return fc
+
+
+def codex_jsonl(*msgs):
+    lines = [json.dumps({"type": "thread.started", "thread_id": "t1"})]
+    lines += [json.dumps({"type": "item.completed", "item": {"id": "i%d" % k, "type": "agent_message", "text": m}})
+              for k, m in enumerate(msgs)]
+    return "\n".join(lines) + "\n"
+
+
+def test_codex_runs_and_saves_log_and_report(env, capsys, monkeypatch):
+    ws, fake, _ = env
+    assert run("dispatch", "5", "--worker", "gpt-6-sol") == 0
+    t = tasks(ws)["ac3ds-re#5"]
+    wt = Path(t["worktree"])
+    assert t["provider"] == "codex" and t["worker"] == "gpt-6-sol"
+    fc = use_codex(monkeypatch, codex_jsonl("途中の文", "最後の返答です"), err="WARN 注意\nERROR 試験のエラー\n")
+    assert run("codex", "5") == 0
+    cmd, cwd, prompt = fc.calls[0]
+    assert cwd == wt
+    assert cmd[:2] == ["codex", "exec"] and cmd[cmd.index("-C") + 1] == str(wt)
+    assert cmd[cmd.index("-s") + 1] == "workspace-write"
+    assert cmd[cmd.index("--add-dir") + 1] == str(ws / "_local" / "state")
+    assert cmd[cmd.index("-m") + 1] == "gpt-6-sol"
+    assert 'model_reasoning_effort="medium"' in cmd and cmd[-2:] == ["--json", "-"]
+    if os.name == "nt":
+        assert 'windows.sandbox="unelevated"' in cmd
+    assert prompt == (ws / "_local" / "orchestrator" / "dispatch" / "5.md").read_text(encoding="utf-8")
+    log = ws / "_local" / "logs" / "codex_ac3ds-re_5_1.jsonl"
+    assert log.read_text(encoding="utf-8") == fc.out
+    t2 = tasks(ws)["ac3ds-re#5"]
+    assert t2["codex_log"] == str(log) and t2["codex_finished_at"]
+    out = capsys.readouterr().out
+    assert "最後の返答です" in out and "エラー行（ERROR を含む）: 1 件" in out
+    assert (wt / ".task" / "report.md").read_text(encoding="utf-8") == \
+        "（ワーカーの最終の返答をオーケストラが保存した）\n最後の返答です\n"
+
+
+def test_codex_keeps_existing_report_and_numbers_logs(env, monkeypatch):
+    ws, fake, _ = env
+    run("dispatch", "5", "--worker", "gpt-6-sol")
+    wt = Path(tasks(ws)["ac3ds-re#5"]["worktree"])
+    (wt / ".task" / "report.md").write_text("手で書いた報告\n", encoding="utf-8")
+    use_codex(monkeypatch, codex_jsonl("別の返答"))
+    assert run("codex", "5") == 0
+    assert run("codex", "5") == 0
+    assert (wt / ".task" / "report.md").read_text(encoding="utf-8") == "手で書いた報告\n"
+    assert (ws / "_local" / "logs" / "codex_ac3ds-re_5_2.jsonl").is_file()
+
+
+def test_codex_failure_returns_1(env, monkeypatch, capsys):
+    ws, fake, _ = env
+    run("dispatch", "5", "--worker", "gpt-6-sol")
+    wt = Path(tasks(ws)["ac3ds-re#5"]["worktree"])
+    use_codex(monkeypatch, "", err="ERROR 起動に失敗\n", code=1)
+    assert run("codex", "5") == 1
+    out = capsys.readouterr().out
+    assert "終了コード: 1" in out and "agent_message が無く" in out
+    assert not (wt / ".task" / "report.md").exists()
+    assert tasks(ws)["ac3ds-re#5"]["codex_log"]
+
+
+def test_codex_refused_for_claude_worker_or_inactive_task(env, monkeypatch):
+    ws, fake, _ = env
+    dispatch(env)  # sonnet-5.5（claude）
+    fc = use_codex(monkeypatch, codex_jsonl("x"))
+    assert run("codex", "5") == 1
+    assert not fc.calls
+    run("reject", "5", "--reason", "試験")
+    assert run("codex", "5") == 1
+    assert not fc.calls
+
+
+def test_codex_dry_run_prints_only(env, monkeypatch, capsys):
+    ws, fake, _ = env
+    run("dispatch", "5", "--worker", "gpt-6-sol")
+    before = tasks(ws)["ac3ds-re#5"]
+    fc = use_codex(monkeypatch, codex_jsonl("x"))
+    assert run("codex", "5", "--dry-run", "--model", "gpt-6-luna", "--effort", "xhigh") == 0
+    out = capsys.readouterr().out
+    assert "gpt-6-luna" in out and "xhigh" in out and "--add-dir" in out
+    if os.name == "nt":
+        assert "unelevated" in out
+    assert not fc.calls and not (ws / "_local" / "logs").exists()
+    assert tasks(ws)["ac3ds-re#5"] == before

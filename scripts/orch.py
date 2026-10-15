@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""オーケストラの道具。台帳（_local/state/tasks.json）を軸に、Issue・依頼・保存・採点用の要約・取り込み・却下を行う。
+"""オーケストラの道具。台帳（_local/state/tasks.json）を軸に、Issue・依頼・Codex の起動・報告の保存・保存・採点用の要約・取り込み・却下を行う。
 
 GitHub への操作は gh_run() の1か所に集め、試験で差し替える。
 """
@@ -128,11 +128,16 @@ def git_ok(c: Ctx, cwd, *args) -> bool:
     return subprocess.run([c.git, *args], cwd=str(cwd), capture_output=True, env=tool_env(c)).returncode == 0
 
 
-def run_py(c: Ctx, wt: Path, script: Path, args: list[str]):
+def child_env(c: Ctx) -> dict:
+    """作業場の道具を子プロセスで動かすときの環境変数（状態の場所と git を渡す）。"""
     env = tool_env(c)
     env.pop("AC3DS_REPO", None)
     env.update({"AC3DS_STATE": str(c.state), "AC3DS_GIT": c.git, "PYTHONIOENCODING": "utf-8"})
-    r = subprocess.run([sys.executable, str(script), *args], cwd=str(wt), env=env, capture_output=True,
+    return env
+
+
+def run_py(c: Ctx, wt: Path, script: Path, args: list[str]):
+    r = subprocess.run([sys.executable, str(script), *args], cwd=str(wt), env=child_env(c), capture_output=True,
                        text=True, encoding="utf-8", errors="replace")
     return r.returncode, (r.stdout + r.stderr).strip()
 
@@ -532,6 +537,174 @@ def cmd_save(a) -> int:
     c = Ctx()
     save_task(c, get_task(c, a.repo, a.issue), a.message)
     return 0
+
+
+# ---------- report / codex ----------
+REPORT_HEADER = "（ワーカーの最終の返答をオーケストラが保存した）"
+
+
+def require_active(t: dict) -> None:
+    if t.get("state") not in ACTIVE:
+        raise OrchError("状態が %s。動いているタスク（dispatched・saved・stamped）でだけ使う" % t.get("state"))
+
+
+def read_source(src: str) -> str:
+    """報告の本文を読む。- は標準入力。UTF-8（BOM 可）、改行は LF にそろえる。"""
+    if src == "-":
+        buf = getattr(sys.stdin, "buffer", None)
+        raw = buf.read() if buf is not None else sys.stdin.read()
+    else:
+        p = Path(src)
+        if not p.is_file():
+            raise OrchError("報告の元のファイルが無い: %s" % src)
+        raw = p.read_bytes()
+    if isinstance(raw, bytes):
+        try:
+            raw = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            raise OrchError("報告が UTF-8 で読めない: %s" % src)
+    return raw.replace("\r\n", "\n")
+
+
+def save_report(t: dict, text: str) -> Path:
+    """作業ツリーの .task/report.md に保存する（先頭に出所の1行を付ける。既にあれば上書きして警告）。"""
+    body = text.strip()
+    if not body:
+        raise OrchError("報告が空")
+    outgoing(body)  # .task/ は追跡されて push されるので、GitHub へ出す本文と同じ検査を掛ける
+    wt = Path(t["worktree"])
+    if not wt.is_dir():
+        raise OrchError("作業ツリーが無い: %s" % wt)
+    f = wt / ".task" / "report.md"
+    existed = f.exists()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(REPORT_HEADER + "\n" + body + "\n", encoding="utf-8", newline="\n")
+    if existed:
+        print("警告: 既存の .task/report.md を上書きした")
+    print("報告を保存: %s" % f)
+    return f
+
+
+def cmd_report(a) -> int:
+    c = Ctx()
+    need_repo(c, a.repo)
+    t = get_task(c, a.repo, a.issue)
+    require_active(t)
+    save_report(t, read_source(a.src))
+    return 0
+
+
+def find_codex() -> str:
+    exe = shutil.which("codex")
+    if not exe:
+        raise OrchError("codex が見つからない（PATH に無い）")
+    return exe
+
+
+def codex_cmd(c: Ctx, wt: Path, exe: str, model: str, effort: str) -> list[str]:
+    cmd = [exe, "exec", "-C", str(wt), "-s", "workspace-write"]
+    if os.name == "nt":
+        cmd += ["-c", 'windows.sandbox="unelevated"']
+    return cmd + ["--add-dir", str(c.state), "-m", model, "-c", 'model_reasoning_effort="%s"' % effort,
+                  "--json", "-"]
+
+
+def run_codex(c: Ctx, cmd: list[str], cwd: Path, prompt: str) -> tuple[int, str, str]:
+    """codex を起動し、終わるまで待つ。試験ではこの関数を差し替える。"""
+    r = subprocess.run(cmd, cwd=str(cwd), input=prompt, capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", env=child_env(c))
+    return r.returncode, r.stdout, r.stderr
+
+
+def next_log(c: Ctx, repo: str, n) -> Path:
+    d = c.data / "logs"
+    d.mkdir(parents=True, exist_ok=True)
+    pat = re.compile(r"codex_%s_%s_(\d+)\.jsonl$" % (re.escape(repo), n))
+    nums = [int(m.group(1)) for p in d.iterdir() if (m := pat.match(p.name))]
+    return d / ("codex_%s_%s_%d.jsonl" % (repo, n, max(nums, default=0) + 1))
+
+
+def _dicts(o):
+    if isinstance(o, dict):
+        yield o
+        for v in o.values():
+            yield from _dicts(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from _dicts(v)
+
+
+def last_agent_message(jsonl: str) -> str | None:
+    """JSONL の最後の agent_message の本文。item.completed の形と msg の形の両方を見る。無ければ None。"""
+    found = None
+    for line in jsonl.splitlines():
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        for d in _dicts(obj):
+            if d.get("type") == "agent_message":
+                txt = d.get("text", d.get("message"))
+                if isinstance(txt, str) and txt.strip():
+                    found = txt
+    return found
+
+
+def cmd_codex(a) -> int:
+    c = Ctx()
+    need_repo(c, a.repo)
+    t = get_task(c, a.repo, a.issue)
+    key = tkey(a.repo, a.issue)
+    if t.get("provider") != "codex":
+        raise OrchError("台帳の provider が codex でない（%s）" % t.get("provider"))
+    require_active(t)
+    model = a.model or t.get("worker")
+    effort = a.effort or t.get("effort")
+    if not effort:
+        raise OrchError("effort が台帳に無い。--effort で指定する")
+    prompt_file = task_file(c, "dispatch", a.repo, a.issue)
+    if not prompt_file.is_file():
+        raise OrchError("依頼文が無い: %s" % prompt_file)
+    wt = Path(t["worktree"])
+    if not wt.is_dir():
+        raise OrchError("作業ツリーが無い: %s" % wt)
+    cmd = codex_cmd(c, wt, find_codex(), model, effort)
+    if a.dry_run:
+        print("dry-run: 実行しない。コマンド:")
+        print(subprocess.list2cmdline(cmd))
+        print("依頼文（標準入力）: %s" % prompt_file)
+        return 0
+    log = next_log(c, a.repo, a.issue)
+    code, out, err = run_codex(c, cmd, wt, prompt_file.read_text(encoding="utf-8"))
+    log.write_text(out, encoding="utf-8", newline="\n")
+    update_task(c, key, codex_log=str(log), codex_finished_at=now())
+    nerr = sum("ERROR" in x for x in out.splitlines() + err.splitlines())
+    print("codex の終了コード: %d（モデル %s、effort %s）" % (code, model, effort))
+    print("エラー行（ERROR を含む）: %d 件" % nerr)
+    print("ログ: %s" % log)
+    if code != 0 and err.strip():
+        print("== stderr の末尾 ==")
+        print("\n".join(err.strip().splitlines()[-20:]))
+    rc = 0 if code == 0 else 1
+    msg = last_agent_message(out)
+    if msg is None:
+        print("（agent_message が無い）")
+    else:
+        print("== 最後の agent_message ==")
+        print(msg)
+    rep = wt / ".task" / "report.md"
+    if rep.exists():
+        print("報告: %s が既にあるので保存しない" % rep)
+    elif msg is None:
+        print("警告: agent_message が無く、報告を保存できない")
+        rc = 1
+    else:
+        try:
+            save_report(t, msg)
+        except OrchError as e:
+            print("エラー: 報告を保存できない: %s" % e)
+            rc = 1
+    return rc
 
 
 # ---------- stamp ----------
@@ -939,6 +1112,13 @@ def main(argv=None) -> int:
     s = add("save", cmd_save)
     s.add_argument("issue", type=int)
     s.add_argument("--message")
+    s = add("report", cmd_report)
+    s.add_argument("issue", type=int)
+    s.add_argument("--from", dest="src", required=True)
+    s = add("codex", cmd_codex, dry=True)
+    s.add_argument("issue", type=int)
+    s.add_argument("--model")
+    s.add_argument("--effort")
     s = add("stamp", cmd_stamp)
     s.add_argument("issue", type=int)
     s = add("accept", cmd_accept, dry=True)
