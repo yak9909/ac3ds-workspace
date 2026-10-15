@@ -10,6 +10,9 @@ stop_at_used_percent = 80   # 5時間枠の使用率がこれ以上なら新し�
 legacy_work_share = 0.3     # 旧記録の作業（再解析・消化）に使う利用枠の上限
 retry_max = 3
 
+[evaluation]
+pass_min = 0.6   # 採点表の全項目がこれ以上なら合格（較正 2026-10-15。0.7 だと正しい記録を落とした）
+
 [reviewer]
 model = "opus-5.5"
 agent = "reviewer"
