@@ -1,0 +1,16 @@
+---
+name: finalize
+description: 採点の後に、合格した結果を取り込む・打ち切る手順と、取り込みの後にすること。
+---
+
+# 取り込みと打ち切り
+
+- **合格**: `python scripts/orch.py accept <Issue番号> --scores <点数>`。ブランチを main に追いつかせ、索引を作り直し、`.task/` を消し、検査を確かめてから取り込む。symbols に変更があれば正本の IDB へ取り込む。
+- **打ち切り**: `python scripts/orch.py reject <Issue番号> --reason <理由>`。
+
+## 取り込みの後
+
+- 報告の「記録すべき事実」（派生のワーカーから）は、解析の Issue にする。
+- 報告の「新しいタグの提案」は、妥当なら `ac3ds-re/meta/tags.toml` に加える（次の取り込みと一緒に）。
+- 消化が必要なカテゴリ（未消化が10件を超えた）があれば、消化の Issue を作る（スキル `consolidation`）。
+- 名前や型が変わったら、派生リポジトリへの影響を `kb.py impact` で確かめる（段階3でゲーム API ヘッダーを作り直す）。

@@ -1,0 +1,15 @@
+#!/bin/sh
+# 派生リポジトリ用。解析リポジトリへの参照と、個人の情報・秘密を拒否する。
+# bootstrap が core.hooksPath に設定する。
+ws=$(cd "$(dirname "$0")/../../.." && pwd)
+py="${AC3DS_PYTHON:-}"
+if [ -z "$py" ]; then
+  if [ -x "$ws/_local/venv/tools/Scripts/python.exe" ]; then
+    py="$ws/_local/venv/tools/Scripts/python.exe"
+  elif [ -x "$ws/_local/venv/tools/bin/python" ]; then
+    py="$ws/_local/venv/tools/bin/python"
+  else
+    py=python
+  fi
+fi
+"$py" "$ws/scripts/check_derived.py" --staged || exit 1

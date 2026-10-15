@@ -1,0 +1,43 @@
+# ワーカーの設定。格付けは ac3ds-re/meta/models.toml にある。
+
+[orchestrator]
+model = "opus-5.5"
+effort = "medium"
+
+[limits]
+max_parallel = 3            # 上限。段階1は1つずつ
+stop_at_used_percent = 80   # 5時間枠の使用率がこれ以上なら新しい依頼を出さない
+legacy_work_share = 0.3     # 旧記録の作業（再解析・消化）に使う利用枠の上限
+retry_max = 3
+
+[reviewer]
+model = "opus-5.5"
+agent = "reviewer"
+effort_hard = "high"
+effort_default = "medium"
+fallback = "gpt-6.1-sol"
+
+[workers."sonnet-5.5"]
+provider = "claude"
+agent = "re-analyst"
+default_effort = "low"
+roles = ["analysis", "simple", "tooling"]
+
+[workers."gpt-6.1-sol"]
+provider = "codex"
+default_effort = "medium"
+roles = ["analysis", "simple"]
+
+[workers."gpt-6-sol"]
+provider = "codex"
+default_effort = "medium"
+roles = ["simple"]
+
+[workers."gpt-6-luna"]
+provider = "codex"
+default_effort = "xhigh"
+roles = ["simple"]
+
+[git]
+commit_trailer = "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+pr_footer = "🤖 Generated with [Claude Code](https://claude.com/claude-code)"

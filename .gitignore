@@ -1,0 +1,22 @@
+# ac3ds-workspace: 既定ですべて無視し、許可した物だけを追跡する。
+# サブリポジトリ（ac3ds-re など）と _local/ は許可していないので無視される。
+/*
+!/.gitignore
+!/.gitattributes
+!/.github/
+!/.claude/
+/.claude/*
+!/.claude/agents/
+!/.claude/settings.json
+!/README.md
+!/AGENTS.md
+!/CLAUDE.md
+!/LICENSE
+!/workspace.toml
+!/workers.toml
+!/skills/
+!/templates/
+!/scripts/
+__pycache__/
+*.pyc
+.pytest_cache/
