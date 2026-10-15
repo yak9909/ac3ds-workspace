@@ -30,21 +30,48 @@ class FakeGh:
         self.origin = origin
         self.issue = {"title": "関数を調べる", "body": ISSUE_BODY, "labels": [{"name": "acnl"}], "state": "OPEN"}
         self.next_pr = 7
+        self.protection = ["audit"]  # main の保護で必須の検査（None なら保護なし）
+        self.checks_script = [[{"name": "audit", "bucket": "pass"}]]  # 呼ぶたびに次を返し、最後を繰り返す（None は no checks）
+        self.checks_calls = 0
+        self.passed = False  # 直近の pr checks が全部通っていたか（merge の拒否に使う）
+        self.view_lag = 0  # 最初の何回の pr view を古い head として返すか
+        self.view_calls = 0
+        self.fail = {}  # "pr ready" などの語 -> 残りの失敗回数
+
+    def head_branch(self):
+        br = next(c for c in self.calls if c[0][:2] == ["pr", "create"])[0]
+        return br[br.index("--head") + 1]
 
     def __call__(self, args, input_text=None):
         self.calls.append((list(args), input_text))
         a = args
+        if self.fail.get(" ".join(a[:2])):
+            self.fail[" ".join(a[:2])] -= 1
+            raise orch.GhError("gh %s: 試験の失敗" % " ".join(a[:2]))
         if a[:2] == ["issue", "view"]:
             return json.dumps(self.issue)
         if a[:2] == ["pr", "create"]:
             return "https://github.com/x/y/pull/%d\n" % self.next_pr
         if a[:2] == ["issue", "create"]:
             return "https://github.com/x/y/issues/12\n"
+        if a[:2] == ["pr", "view"]:
+            self.view_calls += 1
+            if self.view_calls <= self.view_lag:
+                return json.dumps({"headRefOid": "0" * 40})  # push の反映が遅く、古い head が見えている
+            return json.dumps({"headRefOid": g(self.origin, "rev-parse", "refs/heads/" + self.head_branch()).strip()})
         if a[:2] == ["pr", "checks"]:
-            return json.dumps([{"name": "audit", "bucket": "pass"}])
+            items = self.checks_script[min(self.checks_calls, len(self.checks_script) - 1)]
+            self.checks_calls += 1
+            if items is None:
+                raise orch.GhError("gh pr checks: no checks reported on the branch")
+            self.passed = bool(items) and all(i["bucket"] in ("pass", "skipping") for i in items)
+            if any(i["bucket"] == "pending" for i in items):
+                raise orch.GhError("gh pr checks: 保留あり", json.dumps(items), 8)  # gh は保留で終了コード 8
+            return json.dumps(items)
         if a[:2] == ["pr", "merge"]:
-            br = next(c for c in self.calls if c[0][:2] == ["pr", "create"])[0]
-            head = br[br.index("--head") + 1]
+            if self.protection and not self.passed:
+                raise orch.GhError("gh pr merge: main の保護で拒否（必須の検査が通っていない）")
+            head = self.head_branch()
             cl = self.tmp / "mergeclone"
             if cl.exists():
                 shutil.rmtree(cl)
@@ -52,6 +79,10 @@ class FakeGh:
             g(cl, "merge", "--no-ff", "-m", "merge", "origin/" + head)
             g(cl, "push", "origin", "HEAD:main")
             return ""
+        if a[:1] == ["api"] and a[-1].endswith("/branches/main/protection"):
+            if self.protection is None:
+                raise orch.GhError("gh api: Branch not protected (HTTP 404)")
+            return json.dumps({"required_status_checks": {"strict": False, "contexts": self.protection}})
         if a[:1] == ["api"] and "labels?per_page=100" in a[1]:
             return "[]"
         return ""
@@ -95,6 +126,7 @@ def env(tmp_path, monkeypatch):
     fake = FakeGh(tmp_path, origin)
     monkeypatch.setattr(orch, "gh_run", fake)
     monkeypatch.setattr(orch, "CHECK_POLL_SEC", 0)
+    monkeypatch.setattr(orch, "CHECK_APPEAR_SEC", 1)
     # 偽の正本 IDB
     ida = ws / "_local" / "builds" / "acnl_jpn_v15" / "ida"
     ida.mkdir(parents=True)
@@ -191,6 +223,7 @@ def test_save(env):
     wt = Path(t["worktree"])
     assert run("save", "5") == 0  # 変更なし
     assert not fake.named("pr", "create")
+    assert tasks(ws)["ac3ds-re#5"]["attempts"] == 1  # 変更が無ければ番号は進まない
     (wt / "docs").mkdir(exist_ok=True)
     (wt / "docs" / "a.md").write_text("a\n", encoding="utf-8")
     assert run("save", "5", "--message", "最初") == 0
@@ -198,10 +231,13 @@ def test_save(env):
     args = fake.named("pr", "create")[0][0]
     assert "--draft" in args and "Closes #5" in args[args.index("--body") + 1]
     assert tasks(ws)["ac3ds-re#5"]["pr"] == 7
+    assert g(wt, "log", "-1", "--format=%s").strip() == "試行 1: 最初"
     assert "Co-Authored-By: Claude Opus 5.5" in g(wt, "log", "-1", "--format=%B")
     (wt / "docs" / "b.md").write_text("b\n", encoding="utf-8")
     assert run("save", "5") == 0
     assert len(fake.named("pr", "create")) == 1
+    assert g(wt, "log", "-1", "--format=%s").strip() == "試行 2: 作業の保存"
+    assert tasks(ws)["ac3ds-re#5"]["attempts"] == 3
 
 
 def test_save_refused_when_idb_open(env):
@@ -234,6 +270,7 @@ def test_stamp_summary(env, capsys):
     assert "report.md: あり" in out
     t = tasks(ws)["ac3ds-re#5"]
     assert t["state"] == "stamped" and t["stamp_ok"], out
+    assert g(wt, "log", "-1", "--format=%s").strip() == "試行 2: 仕上げ"  # save の後の番号
     assert (ws / "_local" / "orchestrator" / "stamp" / "5.md").exists()
     assert "by: sonnet-5.5" in next((wt / "findings").rglob("ACNL-F*.md")).read_text(encoding="utf-8")
 
@@ -315,3 +352,82 @@ def test_setup_github_dry_and_status(env, capsys):
     assert run("setup-github", "ac3ds-re") == 0
     assert fake.named("api", "-X", "PUT")
     assert run("status") == 0
+
+
+def test_accept_waits_for_checks_of_pushed_commit(env, capsys):
+    ws, fake, origin, wt = ready(env)
+    run("stamp", "5")
+    fake.checks_script = [None, None, [{"name": "audit", "bucket": "pending"}], [{"name": "audit", "bucket": "pass"}]]
+    assert run("accept", "5", "--scores", "a=5") == 0, capsys.readouterr().err
+    assert len(fake.named("pr", "checks")) == 4
+    assert fake.named("pr", "merge")
+
+
+def test_accept_waits_until_pr_head_is_pushed_commit(env):
+    ws, fake, origin, wt = ready(env)
+    run("stamp", "5")
+    fake.view_lag = 2
+    assert run("accept", "5", "--scores", "a=5") == 0
+    assert len(fake.named("pr", "view")) >= 3
+
+
+def test_accept_stops_when_required_check_never_appears(env, capsys, monkeypatch):
+    ws, fake, origin, wt = ready(env)
+    run("stamp", "5")
+    monkeypatch.setattr(orch, "CHECK_APPEAR_SEC", 0)
+    fake.checks_script = [None]
+    assert run("accept", "5", "--scores", "a=5") == 1
+    assert "必須: audit" in capsys.readouterr().err
+    assert not fake.named("pr", "merge")
+    assert tasks(ws)["ac3ds-re#5"]["state"] == "stamped"
+
+
+def test_accept_without_required_checks_warns(env, capsys, monkeypatch):
+    ws, fake, origin, wt = ready(env)
+    run("stamp", "5")
+    monkeypatch.setattr(orch, "CHECK_APPEAR_SEC", 0)
+    fake.protection = None
+    fake.checks_script = [None]
+    assert run("accept", "5", "--scores", "a=5") == 0
+    assert "警告: チェックが1つも無い" in capsys.readouterr().out
+    assert fake.named("pr", "merge")
+
+
+def test_accept_resumes_after_its_own_prep_commit(env):
+    ws, fake, origin, wt = ready(env)
+    run("stamp", "5")
+    fake.fail["pr ready"] = 1
+    assert run("accept", "5", "--scores", "a=5") == 1  # 準備のコミットを作った後で失敗
+    assert tasks(ws)["ac3ds-re#5"]["state"] == "stamped"
+    assert run("accept", "5", "--scores", "a=5") == 0
+    assert tasks(ws)["ac3ds-re#5"]["state"] == "accepted"
+
+
+def test_accept_refuses_change_after_prep_commit(env):
+    ws, fake, origin, wt = ready(env)
+    run("stamp", "5")
+    fake.fail["pr ready"] = 1
+    assert run("accept", "5", "--scores", "a=5") == 1
+    (wt / "docs").mkdir(exist_ok=True)
+    (wt / "docs" / "x.md").write_text("x\n", encoding="utf-8")
+    assert run("accept", "5", "--scores", "a=5") == 1
+    assert not fake.named("pr", "merge")
+
+
+def test_git_gets_tool_venv_first_on_path(env, monkeypatch):
+    ws, fake, _ = env
+    d = ws / "_local" / "venv" / "tools" / ("Scripts" if os.name == "nt" else "bin")
+    d.mkdir(parents=True)
+    real_run = subprocess.run
+    envs = []
+
+    def spy(args, **kw):
+        envs.append(kw.get("env"))
+        return real_run(args, **kw)
+
+    monkeypatch.setattr(orch.subprocess, "run", spy)
+    orch.git(orch.Ctx(), ws, "--version")
+    assert envs[-1] and Path(envs[-1]["PATH"].split(os.pathsep)[0]).resolve() == d.resolve()
+    shutil.rmtree(ws / "_local" / "venv")
+    orch.git(orch.Ctx(), ws, "--version")
+    assert envs[-1]["PATH"] == os.environ["PATH"]

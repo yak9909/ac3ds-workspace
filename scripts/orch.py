@@ -36,6 +36,7 @@ DIFFS = ["easy", "normal", "hard"]
 ACTIVE = ("dispatched", "saved", "stamped")
 DEFAULT_REPO = "ac3ds-re"
 CHECK_POLL_SEC = 15
+CHECK_APPEAR_SEC = 90  # push したコミットに検査が現れるまで待つ上限
 CHECK_TIMEOUT_SEC = 600
 
 LABELS = (
@@ -105,20 +106,30 @@ def gh_run(args, input_text=None) -> str:
     return r.stdout
 
 
+def tool_env(c: Ctx) -> dict:
+    """子プロセス用の環境変数。作業場の道具の venv があれば、その Scripts（bin）を PATH の先頭に足す。
+    リポジトリのフック（pre-commit の python tools/audit.py など）が PATH 上の別の Python を使わないように。"""
+    env = dict(os.environ)
+    d = c.data / "venv" / "tools" / ("Scripts" if os.name == "nt" else "bin")
+    if d.is_dir():
+        env["PATH"] = str(d) + os.pathsep + env.get("PATH", "")
+    return env
+
+
 def git(c: Ctx, cwd, *args, check=True) -> str:
     r = subprocess.run([c.git, "-c", "core.quotepath=off", *args], cwd=str(cwd), capture_output=True,
-                       text=True, encoding="utf-8", errors="replace")
+                       text=True, encoding="utf-8", errors="replace", env=tool_env(c))
     if check and r.returncode != 0:
         raise OrchError("git %s: %s" % (" ".join(args[:3]), (r.stderr or r.stdout).strip()))
     return r.stdout if r.returncode == 0 else ""
 
 
 def git_ok(c: Ctx, cwd, *args) -> bool:
-    return subprocess.run([c.git, *args], cwd=str(cwd), capture_output=True).returncode == 0
+    return subprocess.run([c.git, *args], cwd=str(cwd), capture_output=True, env=tool_env(c)).returncode == 0
 
 
 def run_py(c: Ctx, wt: Path, script: Path, args: list[str]):
-    env = dict(os.environ)
+    env = tool_env(c)
     env.pop("AC3DS_REPO", None)
     env.update({"AC3DS_STATE": str(c.state), "AC3DS_GIT": c.git, "PYTHONIOENCODING": "utf-8"})
     r = subprocess.run([sys.executable, str(script), *args], cwd=str(wt), env=env, capture_output=True,
@@ -495,14 +506,16 @@ def save_task(c: Ctx, t: dict, message: str | None = None) -> bool:
     if not git(c, wt, "status", "--porcelain").strip():
         print("%s: 変更なし（何もしない）" % key)
         return False
-    msg = "試行 %s: %s" % (t.get("attempts", 1), message or "作業の保存")
+    n = t.get("attempts", 1)
+    msg = "試行 %s: %s" % (n, message or "作業の保存")
     pr_title = pr_body = None
     if not t.get("pr"):
         footer = c.workers.get("git", {}).get("pr_footer", "")
         pr_title = t.get("title") or "Issue #%s" % t["issue"]
-        pr_body = "Closes #%s\n\n%s\n\n%s" % (t["issue"], message or "試行 %s の作業内容。" % t.get("attempts", 1), footer)
+        pr_body = "Closes #%s\n\n%s\n\n%s" % (t["issue"], message or "試行 %s の作業内容。" % n, footer)
         outgoing(pr_title, pr_body)
     commit_all(c, wt, msg)
+    update_task(c, key, attempts=n + 1)  # コミットしたら番号を進める（次の保存が同じ番号にならないように）
     git(c, wt, "push", "-u", "origin", t["branch"])
     fields = {"state": "saved", "saved_at": now(), "saved_head": head(c, wt), "stamped_head": None}
     if pr_title:
@@ -584,7 +597,9 @@ def cmd_stamp(a) -> int:
     if role == "analysis" and (wt / "tools" / "audit.py").exists():
         code, out = run_py(c, wt, wt / "tools" / "audit.py", [])
         checks.append(("audit", code, out))
-    commit_all(c, wt, "試行 %s: 仕上げ" % t.get("attempts", 1))
+    n = t.get("attempts", 1)
+    if commit_all(c, wt, "試行 %s: 仕上げ" % n):
+        update_task(c, key, attempts=n + 1)  # save と同じく、コミットのたびに番号を進める
     git(c, wt, "push", "-u", "origin", t["branch"])
     sym, builds = symbols_diff(c, wt, base)
     ok = all(code == 0 for _, code, _ in checks)
@@ -601,7 +616,8 @@ def cmd_stamp(a) -> int:
     f = task_file(c, "stamp", a.repo, a.issue)
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text(text, encoding="utf-8", newline="\n")
-    update_task(c, key, state="stamped", stamped_at=now(), stamped_head=head(c, wt), stamp_ok=ok, symbols_builds=builds)
+    update_task(c, key, state="stamped", stamped_at=now(), stamped_head=head(c, wt), stamp_ok=ok,
+                symbols_builds=builds, prep_head=None)
     print(text)
     print("--- 保存: %s%s" % (f, "" if ok else "（検査に失敗あり。accept は拒否される）"))
     return 0
@@ -625,29 +641,66 @@ def parse_scores(s: str) -> dict:
     return out
 
 
-def wait_checks(c: Ctx, slug: str, pr) -> None:
-    end = time.time() + CHECK_TIMEOUT_SEC
+def required_checks(c: Ctx, slug: str) -> list[str]:
+    """main の保護で必須になっている検査の名前。保護が無ければ []。"""
+    try:
+        out = gh_run(["api", "repos/%s/branches/main/protection" % slug])
+    except GhError as e:
+        if "404" in str(e):
+            return []
+        raise
+    try:
+        rs = json.loads(out or "{}").get("required_status_checks") or {}
+    except ValueError:
+        raise OrchError("main の保護の読み取り結果が JSON でない")
+    return list(rs.get("contexts") or []) + [x.get("context", "") for x in rs.get("checks") or []]
+
+
+def pr_head_oid(slug: str, pr) -> str:
+    try:
+        return json.loads(gh_run(["pr", "view", str(pr), "--repo", slug, "--json", "headRefOid"])).get("headRefOid", "")
+    except ValueError:
+        return ""
+
+
+def checks_now(slug: str, pr) -> list[dict]:
+    """PR の今の検査。まだ1つも登録されていなければ []（gh は「no checks」で失敗する）。"""
+    try:
+        raw = gh_run(["pr", "checks", str(pr), "--repo", slug, "--json", "name,bucket"])
+    except GhError as e:
+        if not e.stdout.strip():
+            if "no checks" in str(e):
+                return []
+            raise
+        raw = e.stdout  # 保留や失敗があると gh は終了コードが 0 でなくても JSON を出す
+    try:
+        return json.loads(raw or "[]")
+    except ValueError:
+        return []
+
+
+def wait_checks(c: Ctx, slug: str, pr, sha: str) -> None:
+    """push したコミット sha の検査が現れるまで待ち（必須の検査が揃うのが条件）、完了まで待つ。"""
+    need = set(required_checks(c, slug))
+    end = time.time() + CHECK_APPEAR_SEC
     while True:
-        try:
-            raw = gh_run(["pr", "checks", str(pr), "--repo", slug, "--json", "name,bucket"])
-        except GhError as e:
-            raw = e.stdout
-            if not raw.strip():
-                if "no checks" in str(e):
-                    print("警告: チェックが1つも無い。続ける")
-                    return
-                raise
-        try:
-            items = json.loads(raw or "[]")
-        except ValueError:
-            items = []
-        if not items:
+        items = checks_now(slug, pr) if pr_head_oid(slug, pr) == sha else []
+        if items and need <= {i.get("name") for i in items}:
+            break
+        if time.time() > end:
+            if need:
+                raise OrchError("push したコミットの検査が %d 秒たっても揃わない（必須: %s）"
+                                % (CHECK_APPEAR_SEC, ", ".join(sorted(need))))
             print("警告: チェックが1つも無い。続ける")
             return
+        time.sleep(CHECK_POLL_SEC)
+    end = time.time() + CHECK_TIMEOUT_SEC
+    while True:
+        items = checks_now(slug, pr)
         b = [i.get("bucket") for i in items]
         if any(x in ("fail", "cancel") for x in b):
             raise OrchError("チェックが失敗: " + ", ".join(i["name"] for i in items if i.get("bucket") in ("fail", "cancel")))
-        if all(x in ("pass", "skipping") for x in b):
+        if items and need <= {i.get("name") for i in items} and all(x in ("pass", "skipping") for x in b):
             return
         if time.time() > end:
             raise OrchError("チェックが10分で終わらない")
@@ -679,7 +732,7 @@ def import_canonical(c: Ctx, t: dict, short: str) -> str:
             bk.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(canon, bk)
             r = subprocess.run([py, str(script), "--idb", str(canon), "--symbols", str(repo_dir / "symbols" / b)],
-                               capture_output=True, text=True, encoding="utf-8", errors="replace")
+                               capture_output=True, text=True, encoding="utf-8", errors="replace", env=tool_env(c))
             if r.returncode != 0:
                 print("エラー: 取り込み失敗(%s): %s" % (b, (r.stderr or r.stdout).strip()[-300:]))
                 status = "取り込み失敗"
@@ -700,7 +753,8 @@ def cmd_accept(a) -> int:
         raise OrchError("状態が %s。先に stamp が要る" % t.get("state"))
     if not t.get("stamp_ok"):
         raise OrchError("stamp の検査に失敗がある。直して save → stamp をやり直す")
-    if git(c, wt, "status", "--porcelain").strip() or head(c, wt) != t.get("stamped_head"):
+    # stamp の後の変更は、accept 自身が作った準備のコミットだけ許す（途中で失敗した accept のやり直し）
+    if git(c, wt, "status", "--porcelain").strip() or head(c, wt) not in (t.get("stamped_head"), t.get("prep_head")):
         raise OrchError("stamp の後に変更がある。もう一度 stamp する")
     slug = repo_slug(c, a.repo)
     comment = "合格\n\n採点: " + ", ".join("%s=%g" % kv for kv in scores.items())
@@ -708,30 +762,34 @@ def cmd_accept(a) -> int:
         print("dry-run: 次を行う（何も書かない）")
         for s in ("origin/main を取り込み（merge）", "索引を作り直し、.task/ を消してコミット・push",
                   "PR #%s にコメント「%s」" % (t["pr"], comment.replace("\n", " ")), "PR を ready に",
-                  "チェックを待つ（最大10分）", "gh pr merge --merge",
+                  "検査が揃うのを待ち、完了を待つ（最大 %d 秒・%d 分）" % (CHECK_APPEAR_SEC, CHECK_TIMEOUT_SEC // 60),
+                  "gh pr merge --merge",
                   "手元の main を更新", "symbols 変更(%s)があれば正本の IDB へ取り込み" % (t.get("symbols_builds") or "なし"),
                   "台帳を accepted に"):
             print("  - " + s)
         return 0
     outgoing(comment)
     git(c, wt, "fetch", "origin")
-    mr = subprocess.run([c.git, "merge", "origin/main", "-m", "main を取り込み"], cwd=str(wt), capture_output=True, text=True)
+    mr = subprocess.run([c.git, "merge", "origin/main", "-m", "main を取り込み"], cwd=str(wt), capture_output=True,
+                        text=True, env=tool_env(c))
     if mr.returncode != 0:
-        subprocess.run([c.git, "merge", "--abort"], cwd=str(wt), capture_output=True)
+        subprocess.run([c.git, "merge", "--abort"], cwd=str(wt), capture_output=True, env=tool_env(c))
         raise OrchError("main の取り込みで衝突。手で解決する:\n" + (mr.stdout + mr.stderr).strip()[-300:])
     kb = wt / "tools" / "kb.py"
     if kb.exists():
         run_py(c, wt, kb, ["index"])
     shutil.rmtree(wt / ".task", ignore_errors=True)
     commit_all(c, wt, "取り込み準備")
+    update_task(c, key, prep_head=head(c, wt))  # 以後に失敗しても、やり直しでこの準備のコミットを許す
     if kb.exists():
         code, out = run_py(c, wt, kb, ["lint"])
         if code != 0:
             raise OrchError("取り込み前の lint が失敗:\n" + out[-400:])
     git(c, wt, "push", "origin", t["branch"])
+    sha = head(c, wt)
     gh_run(["pr", "comment", str(t["pr"]), "--repo", slug, "--body", comment])
     gh_run(["pr", "ready", str(t["pr"]), "--repo", slug])
-    wait_checks(c, slug, t["pr"])
+    wait_checks(c, slug, t["pr"], sha)
     gh_run(["pr", "merge", str(t["pr"]), "--repo", slug, "--merge"])
     repo_dir = c.root / a.repo
     git(c, repo_dir, "fetch", "origin")
