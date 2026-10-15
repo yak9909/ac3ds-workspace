@@ -406,7 +406,10 @@ def cmd_issue(a) -> int:
     for lb in (a.scope, a.kind, a.difficulty):
         args += ["--label", lb]
     out = gh_run(args)
-    print("Issue を作成: #%s %s" % (pr_number(out), title))
+    number = pr_number(out)
+    print("Issue を作成: #%s %s" % (number, title))
+    repo_option = " --repo %s" % a.repo if a.repo != DEFAULT_REPO else ""
+    print("次の依頼: python scripts/orch.py dispatch %s --worker ...%s" % (number, repo_option))
     return 0
 
 
@@ -437,7 +440,16 @@ def cmd_dispatch(a) -> int:
     usage = read_usage(c)
     if usage is not None and usage >= lim and not a.ignore_limit:
         raise OrchError("5時間枠の使用率 %s%% が上限 %s%% 以上なので依頼しない（--ignore-limit で無視）" % (usage, lim))
+    raw = gh_run(["api", "repos/%s/issues/%s" % (repo_slug(c, a.repo), a.issue)])
+    try:
+        issue_api = json.loads(raw)
+    except ValueError:
+        raise OrchError("Issue #%s の種別確認結果が JSON でない" % a.issue)
+    if "pull_request" in issue_api:
+        raise OrchError("#%s は PR。Issue の番号を指定する" % a.issue)
     issue = read_issue(c, a.repo, a.issue)
+    if issue.get("state") != "OPEN":
+        raise OrchError("Issue #%s は開いていない。開いた Issue の番号を指定する" % a.issue)
     sec = parse_sections(issue.get("body", ""))
     scope = sec.get("スコープ", "").strip()
     if scope not in SCOPES:

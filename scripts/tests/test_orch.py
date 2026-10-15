@@ -30,6 +30,7 @@ class FakeGh:
         self.tmp = tmp
         self.origin = origin
         self.issue = {"title": "関数を調べる", "body": ISSUE_BODY, "labels": [{"name": "acnl"}], "state": "OPEN"}
+        self.issue_api = {}
         self.next_pr = 7
         self.protection = ["audit"]  # main の保護で必須の検査（None なら保護なし）
         self.checks_script = [[{"name": "audit", "bucket": "pass"}]]  # 呼ぶたびに次を返し、最後を繰り返す（None は no checks）
@@ -51,6 +52,8 @@ class FakeGh:
             raise orch.GhError("gh %s: 試験の失敗" % " ".join(a[:2]))
         if a[:2] == ["issue", "view"]:
             return json.dumps(self.issue)
+        if a[:2] == ["api", "repos/o/ac3ds-re/issues/5"]:
+            return json.dumps(self.issue_api)
         if a[:2] == ["pr", "create"]:
             return "https://github.com/x/y/pull/%d\n" % self.next_pr
         if a[:2] == ["issue", "create"]:
@@ -175,6 +178,7 @@ def test_issue(env, capsys):
     body = args[args.index("--body") + 1]
     assert "### 目的と完了条件" in body and "### 関係する資料" in body
     assert args.count("--label") == 3
+    assert "python scripts/orch.py dispatch 12 --worker ..." in capsys.readouterr().out
     # 必須項目の欠け
     assert run("issue", "--scope", "hhd", "--kind", "analysis", "--difficulty", "easy", "--title", "x",
                "--goal", " ", "--target", "t", "--materials", "なし") == 1
@@ -196,6 +200,7 @@ def test_outgoing_rejected(env):
 def test_dispatch(env):
     ws, fake, _ = env
     assert dispatch(env) == 0
+    assert fake.named("api", "repos/o/ac3ds-re/issues/5")
     t = tasks(ws)["ac3ds-re#5"]
     wt = Path(t["worktree"])
     assert wt.is_dir() and (wt / ".task").is_dir()
@@ -209,6 +214,31 @@ def test_dispatch(env):
     # 再試行は作業ツリーを再利用して試行回数が増える
     assert dispatch(env) == 0
     assert tasks(ws)["ac3ds-re#5"]["attempts"] == 2
+
+
+@pytest.mark.parametrize("kind", ["pr", "closed"])
+def test_dispatch_rejects_pr_or_closed_issue_without_creating_files(env, monkeypatch, capsys, kind):
+    ws, fake, _ = env
+    if kind == "pr":
+        fake.issue_api = {"pull_request": {"url": "https://api.github.com/repos/o/ac3ds-re/pulls/5"}}
+    else:
+        fake.issue["state"] = "CLOSED"
+
+    def unexpected_git(*args, **kwargs):
+        pytest.fail("dispatch が Git を呼んだ")
+
+    monkeypatch.setattr(orch, "git", unexpected_git)
+    monkeypatch.setattr(orch, "git_ok", unexpected_git)
+    assert dispatch(env) == 1
+    err = capsys.readouterr().err
+    assert ("#5 は PR" if kind == "pr" else "Issue #5 は開いていない") in err
+    assert fake.named("api", "repos/o/ac3ds-re/issues/5")
+    assert len(fake.named("issue", "view")) == (0 if kind == "pr" else 1)
+    assert not (ws / "_local" / "worktrees" / "ac3ds-re" / "5").exists()
+    assert not (ws / "_local" / "builds" / "acnl_jpn_v15" / "ida" / "work" / "5").exists()
+    assert not (ws / "_local" / "state" / "tasks.json").exists()
+    assert not (ws / "_local" / "orchestrator" / "dispatch" / "5.md").exists()
+    assert not (ws / "ac3ds-re" / ".git" / "refs" / "heads" / "task").exists()
 
 
 def test_dispatch_no_canonical_idb(env):
