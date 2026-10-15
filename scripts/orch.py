@@ -602,12 +602,14 @@ def find_codex() -> str:
 
 
 def codex_cmd(c: Ctx, wt: Path, exe: str, model: str, effort: str, idb_path: str | None = None) -> list[str]:
-    cmd = [exe, "exec", "-C", str(wt), "-s", "workspace-write"]
-    if os.name == "nt":
-        cmd += ["-c", 'windows.sandbox="unelevated"']
-    cmd += ["--add-dir", str(c.state)]
+    cmd = [exe, "exec", "-C", str(wt)]
     if idb_path:
-        cmd += ["--add-dir", str(Path(idb_path).parent)]
+        cmd += ["--dangerously-bypass-approvals-and-sandbox"]
+    else:
+        cmd += ["-s", "workspace-write"]
+        if os.name == "nt":
+            cmd += ["-c", 'windows.sandbox="unelevated"']
+        cmd += ["--add-dir", str(c.state)]
     return cmd + ["-m", model, "-c", 'model_reasoning_effort="%s"' % effort, "--json", "-"]
 
 
@@ -616,6 +618,21 @@ def run_codex(c: Ctx, cmd: list[str], cwd: Path, prompt: str) -> tuple[int, str,
     r = subprocess.run(cmd, cwd=str(cwd), input=prompt, capture_output=True, text=True, encoding="utf-8",
                        errors="replace", env=child_env(c))
     return r.returncode, r.stdout, r.stderr
+
+
+def git_launch_state(c: Ctx, wt: Path) -> dict:
+    """サンドボックス無しの起動を挟んで比較する Git の状態。"""
+    return {
+        "HEAD": git(c, wt, "rev-parse", "HEAD").strip(),
+        "ブランチ": git(c, wt, "branch", "--show-current").strip(),
+        "ステージ済みファイル": git(c, wt, "diff", "--cached", "--name-only").splitlines(),
+        "stash 件数": len(git(c, wt, "stash", "list").splitlines()),
+    }
+
+
+def git_launch_violation(before: dict, after: dict) -> str:
+    return "、".join("%s: %s → %s" % (name, before[name], after[name])
+                    for name in before if before[name] != after[name])
 
 
 def next_log(c: Ctx, repo: str, n) -> Path:
@@ -674,11 +691,21 @@ def cmd_codex(a) -> int:
     cmd = codex_cmd(c, wt, find_codex(), model, effort, idb["path"] if idb else None)
     if a.dry_run:
         print("dry-run: 実行しない。コマンド:")
+        if idb:
+            print("サンドボックス無し（IDA を使うタスク）")
         print(subprocess.list2cmdline(cmd))
         print("依頼文（標準入力）: %s" % prompt_file)
         return 0
     log = next_log(c, a.repo, a.issue)
-    code, out, err = run_codex(c, cmd, wt, prompt_file.read_text(encoding="utf-8"))
+    before = git_launch_state(c, wt) if idb else None
+    try:
+        code, out, err = run_codex(c, cmd, wt, prompt_file.read_text(encoding="utf-8"))
+    finally:
+        if before is not None:
+            violation = git_launch_violation(before, git_launch_state(c, wt))
+            if violation:
+                print("警告: ワーカーが Git に書き込んだ: %s" % violation)
+                update_task(c, key, git_violation=violation)
     log.write_text(out, encoding="utf-8", newline="\n")
     update_task(c, key, codex_log=str(log), codex_finished_at=now())
     nerr = sum("ERROR" in x for x in out.splitlines() + err.splitlines())

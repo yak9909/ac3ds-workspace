@@ -574,17 +574,45 @@ def test_codex_dry_run_prints_only(env, monkeypatch, capsys):
 
 
 @pytest.mark.parametrize("with_idb", [True, False])
-def test_codex_dry_run_add_dirs(env, monkeypatch, capsys, with_idb):
+def test_codex_dry_run_sandbox_mode(env, monkeypatch, capsys, with_idb):
     ws, _, _ = env
     args = ["dispatch", "5", "--worker", "gpt-6-sol"]
     assert run(*(args + (["--idb"] if with_idb else []))) == 0
-    task = tasks(ws)["ac3ds-re#5"]
     monkeypatch.setattr(orch, "find_codex", lambda: "codex")
     assert run("codex", "5", "--dry-run") == 0
-    command = capsys.readouterr().out.split("dry-run: 実行しない。コマンド:\n", 1)[1].splitlines()[0]
-    expected = [ws / "_local" / "state"]
+    output = capsys.readouterr().out
+    command = output.split("dry-run: 実行しない。コマンド:\n", 1)[1].splitlines()[-2]
     if with_idb:
-        expected.append(Path(task["idb"]["path"]).parent)
-    assert command.count("--add-dir") == len(expected)
-    for path in expected:
-        assert subprocess.list2cmdline(["--add-dir", str(path)]) in command
+        assert "サンドボックス無し（IDA を使うタスク）" in output
+        assert "--dangerously-bypass-approvals-and-sandbox" in command
+        assert " -s " not in command and "--add-dir" not in command
+        assert 'windows.sandbox=' not in command
+    else:
+        assert "サンドボックス無し" not in output
+        assert "--dangerously-bypass-approvals-and-sandbox" not in command
+        assert " -s workspace-write" in command
+        assert subprocess.list2cmdline(["--add-dir", str(ws / "_local" / "state")]) in command
+        if os.name == "nt":
+            assert 'windows.sandbox=' in command
+
+
+def test_codex_idb_records_git_commit_violation(env, monkeypatch, capsys):
+    ws, _, _ = env
+    assert run("dispatch", "5", "--worker", "gpt-6-sol", "--idb") == 0
+    wt = Path(tasks(ws)["ac3ds-re#5"]["worktree"])
+    monkeypatch.setattr(orch, "find_codex", lambda: "codex")
+
+    def fake_run(c, cmd, cwd, prompt):
+        assert "--dangerously-bypass-approvals-and-sandbox" in cmd
+        (wt / ".task" / "worker-change.txt").write_text("変更\n", encoding="utf-8")
+        g(wt, "add", ".task/worker-change.txt")
+        g(wt, "commit", "-m", "worker commit")
+        return 0, codex_jsonl("報告"), ""
+
+    monkeypatch.setattr(orch, "run_codex", fake_run)
+    assert run("codex", "5") == 0
+    output = capsys.readouterr().out
+    violation = tasks(ws)["ac3ds-re#5"]["git_violation"]
+    assert "警告: ワーカーが Git に書き込んだ" in output
+    assert "HEAD:" in violation and "HEAD:" in output
+    assert g(wt, "rev-parse", "HEAD").strip() in violation
