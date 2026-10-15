@@ -507,7 +507,8 @@ def test_codex_runs_and_saves_log_and_report(env, capsys, monkeypatch):
     assert cwd == wt
     assert cmd[:2] == ["codex", "exec"] and cmd[cmd.index("-C") + 1] == str(wt)
     assert cmd[cmd.index("-s") + 1] == "workspace-write"
-    assert cmd[cmd.index("--add-dir") + 1] == str(ws / "_local" / "state")
+    assert [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--add-dir"] == [
+        str(ws / "_local" / "state")]
     assert cmd[cmd.index("-m") + 1] == "gpt-6-sol"
     assert 'model_reasoning_effort="medium"' in cmd and cmd[-2:] == ["--json", "-"]
     if os.name == "nt":
@@ -570,3 +571,20 @@ def test_codex_dry_run_prints_only(env, monkeypatch, capsys):
         assert "unelevated" in out
     assert not fc.calls and not (ws / "_local" / "logs").exists()
     assert tasks(ws)["ac3ds-re#5"] == before
+
+
+@pytest.mark.parametrize("with_idb", [True, False])
+def test_codex_dry_run_add_dirs(env, monkeypatch, capsys, with_idb):
+    ws, _, _ = env
+    args = ["dispatch", "5", "--worker", "gpt-6-sol"]
+    assert run(*(args + (["--idb"] if with_idb else []))) == 0
+    task = tasks(ws)["ac3ds-re#5"]
+    monkeypatch.setattr(orch, "find_codex", lambda: "codex")
+    assert run("codex", "5", "--dry-run") == 0
+    command = capsys.readouterr().out.split("dry-run: 実行しない。コマンド:\n", 1)[1].splitlines()[0]
+    expected = [ws / "_local" / "state"]
+    if with_idb:
+        expected.append(Path(task["idb"]["path"]).parent)
+    assert command.count("--add-dir") == len(expected)
+    for path in expected:
+        assert subprocess.list2cmdline(["--add-dir", str(path)]) in command

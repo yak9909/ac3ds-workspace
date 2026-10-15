@@ -601,12 +601,14 @@ def find_codex() -> str:
     return exe
 
 
-def codex_cmd(c: Ctx, wt: Path, exe: str, model: str, effort: str) -> list[str]:
+def codex_cmd(c: Ctx, wt: Path, exe: str, model: str, effort: str, idb_path: str | None = None) -> list[str]:
     cmd = [exe, "exec", "-C", str(wt), "-s", "workspace-write"]
     if os.name == "nt":
         cmd += ["-c", 'windows.sandbox="unelevated"']
-    return cmd + ["--add-dir", str(c.state), "-m", model, "-c", 'model_reasoning_effort="%s"' % effort,
-                  "--json", "-"]
+    cmd += ["--add-dir", str(c.state)]
+    if idb_path:
+        cmd += ["--add-dir", str(Path(idb_path).parent)]
+    return cmd + ["-m", model, "-c", 'model_reasoning_effort="%s"' % effort, "--json", "-"]
 
 
 def run_codex(c: Ctx, cmd: list[str], cwd: Path, prompt: str) -> tuple[int, str, str]:
@@ -668,7 +670,8 @@ def cmd_codex(a) -> int:
     wt = Path(t["worktree"])
     if not wt.is_dir():
         raise OrchError("作業ツリーが無い: %s" % wt)
-    cmd = codex_cmd(c, wt, find_codex(), model, effort)
+    idb = t.get("idb")
+    cmd = codex_cmd(c, wt, find_codex(), model, effort, idb["path"] if idb else None)
     if a.dry_run:
         print("dry-run: 実行しない。コマンド:")
         print(subprocess.list2cmdline(cmd))
