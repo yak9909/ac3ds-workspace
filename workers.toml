@@ -27,8 +27,8 @@ roles = ["analysis", "simple", "tooling"]
 provider = "claude"
 agent = "tooling"
 default_effort = "xhigh"
-roles = ["simple", "tooling"]
-note = "試用（2026-10-15〜）。難易度の低いタスク"
+roles = ["simple", "tooling", "analysis-light"]
+note = "2026-10-15〜。易しい作業全般と易しめの normal を最初に担当。駄目なら sonnet-5.5"
 
 [workers."gpt-6.1-sol"]
 provider = "codex"

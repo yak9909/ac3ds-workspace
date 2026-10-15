@@ -12,7 +12,7 @@ description: 作業場のメインのセッション（オーケストラ）と�
 1. **開始**: `python scripts/orch.py start`（引き継ぎメモ・Issue・利用率・間が空いた定期作業）。
 2. **受付**: 目的と完了条件を確かめる。`python ac3ds-re/tools/kb.py search` と `addr` で既存の知見を引き、`orch.py issue` で Issue にする。
 3. **依頼**: 5時間枠の使用率が 80% 以上なら出さない。スキル `dispatch` でワーカーを選び、`orch.py dispatch` で準備してから起動する。
-4. **評価**: `orch.py save` → `orch.py stamp` → スキル `evaluate` で採点する。
+4. **評価**: Claude のワーカーの返答（報告）を `orch.py report <Issue> --from -` で保存 → `orch.py save` → `orch.py stamp` → スキル `evaluate` で採点する。
 5. **確定**: スキル `finalize`（合格は `orch.py accept`、打ち切りは `orch.py reject`）。
 6. **報告**: 完了したこと・判断してほしいこと・実機確認の依頼を利用者に伝える。
 

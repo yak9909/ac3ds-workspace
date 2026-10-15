@@ -10,11 +10,14 @@ description: オーケストラがワーカーに作業を依頼するとき・�
 | 作業 | 難易度 | ワーカー（effort は workers.toml の既定） |
 |---|---|---|
 | 解析・rename・型定義・消化・再解析 | hard | sonnet-5.5 か gpt-6.1-sol（格付け A 以上）。利用枠に余裕のある方 |
-| 同上 | normal | 同上。B（gpt-6-sol）も可 |
-| 取り込み・分類・要約の下書き・LOW の登録・書き出し・変換 | easy | gpt-6-sol・gpt-6-luna・gpt-6.1-sol（段階1a は Claude ワーカー） |
-| 派生リポジトリの実装 | 難易度で選ぶ | 複雑なら sonnet-5.5 か gpt-6.1-sol |
+| 同上 | normal | 易しめなら haiku-5.5 から始め、結果が良くなければ sonnet-5.5。それ以外は hard と同じ。B（gpt-6-sol）も可 |
+| 単純作業（取り込み・変換・書き出し・機械的な分類） | easy | Codex（gpt-6-sol・gpt-6-luna・gpt-6.1-sol） |
+| その他の易しい作業（道具の小さな修正・調べ物・要約の下書き・LOW の登録など） | easy | haiku-5.5 |
+| 道具づくり・派生リポジトリの実装 | 難易度で選ぶ | easy と易しめの normal は haiku-5.5、それ以外は sonnet-5.5 か gpt-6.1-sol |
 
-- 担当できる格付け: hard は A 以上、normal は B 以上、easy は誰でも。
+- 担当できる格付け: hard は A 以上、normal は B 以上、easy は誰でも。例外として、易しめの normal は haiku-5.5（C）に任せてよい（利用者の指示）。その解析記録は A 以上の確認を経る。
+- haiku-5.5 の結果が直せそうなら、同じセッションに修正を頼む（`SendMessage`）。直せそうにないとき、2回直しても駄目なときは sonnet-5.5 に替える。
+- Codex は `python scripts/orch.py codex <Issue>` で起動する。
 - 旧記録の作業（「?」の記録の再解析・消化）は、利用枠の3割までにする。
 
 ## 依頼文
@@ -31,7 +34,7 @@ description: オーケストラがワーカーに作業を依頼するとき・�
 
 1. 同じ作業ツリーで、同じセッションにフォローアップする（失敗理由と、不足していた前提を伝える）。
 2. effort を上げる。
-3. モデルを上げる（例: gpt-6-sol → gpt-6.1-sol、sonnet-5.5 → gpt-6.1-sol）。
+3. モデルを上げる（例: haiku-5.5 → sonnet-5.5、gpt-6-sol → gpt-6.1-sol、sonnet-5.5 → gpt-6.1-sol）。
 4. それでも駄目なら Issue を `blocked` にして利用者に報告する。
 
 - 最初からやり直すときは、今の PR を理由付きで閉じ、新しいブランチと PR で始める（同じ Issue に結び付ける）。
