@@ -23,6 +23,13 @@ agent = "re-analyst"
 default_effort = "low"
 roles = ["analysis", "simple", "tooling"]
 
+[workers."haiku-5.5"]
+provider = "claude"
+agent = "tooling"
+default_effort = "xhigh"
+roles = ["simple", "tooling"]
+note = "試用（2026-10-15〜）。難易度の低いタスク"
+
 [workers."gpt-6.1-sol"]
 provider = "codex"
 default_effort = "medium"
