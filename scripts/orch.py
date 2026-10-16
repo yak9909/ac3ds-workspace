@@ -613,7 +613,23 @@ def find_codex() -> str:
     return exe
 
 
-def codex_cmd(c: Ctx, wt: Path, exe: str, model: str, effort: str, idb_path: str | None = None) -> list[str]:
+def evidence_dir(c: Ctx, repo: str, issue: int) -> Path:
+    name = str(issue) if repo == DEFAULT_REPO else "%s-%s" % (repo, issue)
+    return c.data / "evidence" / name
+
+
+def codex_cmd(c: Ctx, wt: Path, exe: str, model: str, effort: str, idb_path: str | None = None,
+              evidence: Path | None = None, thread_id: str | None = None) -> list[str]:
+    if thread_id:
+        cmd = [exe, "exec", "resume", thread_id]
+        if idb_path:
+            cmd += ["--dangerously-bypass-approvals-and-sandbox"]
+        else:
+            if os.name == "nt":
+                cmd += ["-c", 'windows.sandbox="unelevated"']
+            roots = [str(c.state), str(evidence)]
+            cmd += ["-c", "sandbox_workspace_write.writable_roots=" + json.dumps(roots, ensure_ascii=False)]
+        return cmd + ["-m", model, "-c", 'model_reasoning_effort="%s"' % effort, "--json", "-"]
     cmd = [exe, "exec", "-C", str(wt)]
     if idb_path:
         cmd += ["--dangerously-bypass-approvals-and-sandbox"]
@@ -622,6 +638,7 @@ def codex_cmd(c: Ctx, wt: Path, exe: str, model: str, effort: str, idb_path: str
         if os.name == "nt":
             cmd += ["-c", 'windows.sandbox="unelevated"']
         cmd += ["--add-dir", str(c.state)]
+        cmd += ["--add-dir", str(evidence)]
     return cmd + ["-m", model, "-c", 'model_reasoning_effort="%s"' % effort, "--json", "-"]
 
 
@@ -681,6 +698,17 @@ def last_agent_message(jsonl: str) -> str | None:
     return found
 
 
+def codex_thread_id(jsonl: str) -> str | None:
+    for line in jsonl.splitlines():
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and obj.get("type") == "thread.started" and isinstance(obj.get("thread_id"), str):
+            return obj["thread_id"] or None
+    return None
+
+
 def cmd_codex(a) -> int:
     c = Ctx()
     need_repo(c, a.repo)
@@ -693,14 +721,33 @@ def cmd_codex(a) -> int:
     effort = a.effort or t.get("effort")
     if not effort:
         raise OrchError("effort が台帳に無い。--effort で指定する")
-    prompt_file = task_file(c, "dispatch", a.repo, a.issue)
-    if not prompt_file.is_file():
-        raise OrchError("依頼文が無い: %s" % prompt_file)
+    if a.resume and not a.message_file:
+        raise OrchError("--resume には --message-file が要る")
+    if a.message_file and not a.resume:
+        raise OrchError("--message-file は --resume と一緒に指定する")
+    if a.resume:
+        old_log = Path(t["codex_log"]) if t.get("codex_log") else None
+        if old_log is None or not old_log.is_file():
+            raise OrchError("続きに使う Codex のログが無い")
+        thread_id = codex_thread_id(old_log.read_text(encoding="utf-8"))
+        if not thread_id:
+            raise OrchError("Codex のログに thread_id が無い: %s" % old_log)
+        prompt_file = a.message_file
+        prompt = read_source(prompt_file)
+    else:
+        prompt_file = task_file(c, "dispatch", a.repo, a.issue)
+        if not prompt_file.is_file():
+            raise OrchError("依頼文が無い: %s" % prompt_file)
+        thread_id = None
+        prompt = prompt_file.read_text(encoding="utf-8")
     wt = Path(t["worktree"])
     if not wt.is_dir():
         raise OrchError("作業ツリーが無い: %s" % wt)
     idb = t.get("idb")
-    cmd = codex_cmd(c, wt, find_codex(), model, effort, idb["path"] if idb else None)
+    evidence = evidence_dir(c, a.repo, a.issue)
+    if not idb and not a.dry_run:
+        evidence.mkdir(parents=True, exist_ok=True)
+    cmd = codex_cmd(c, wt, find_codex(), model, effort, idb["path"] if idb else None, evidence, thread_id)
     if a.dry_run:
         print("dry-run: 実行しない。コマンド:")
         if idb:
@@ -711,7 +758,7 @@ def cmd_codex(a) -> int:
     log = next_log(c, a.repo, a.issue)
     before = git_launch_state(c, wt) if idb else None
     try:
-        code, out, err = run_codex(c, cmd, wt, prompt_file.read_text(encoding="utf-8"))
+        code, out, err = run_codex(c, cmd, wt, prompt)
     finally:
         if before is not None:
             violation = git_launch_violation(before, git_launch_state(c, wt))
@@ -1161,6 +1208,8 @@ def main(argv=None) -> int:
     s.add_argument("issue", type=int)
     s.add_argument("--model")
     s.add_argument("--effort")
+    s.add_argument("--resume", action="store_true")
+    s.add_argument("--message-file")
     s = add("stamp", cmd_stamp)
     s.add_argument("issue", type=int)
     s = add("accept", cmd_accept, dry=True)

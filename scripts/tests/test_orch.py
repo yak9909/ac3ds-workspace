@@ -538,7 +538,8 @@ def test_codex_runs_and_saves_log_and_report(env, capsys, monkeypatch):
     assert cmd[:2] == ["codex", "exec"] and cmd[cmd.index("-C") + 1] == str(wt)
     assert cmd[cmd.index("-s") + 1] == "workspace-write"
     assert [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--add-dir"] == [
-        str(ws / "_local" / "state")]
+        str(ws / "_local" / "state"), str(ws / "_local" / "evidence" / "5")]
+    assert (ws / "_local" / "evidence" / "5").is_dir()
     assert cmd[cmd.index("-m") + 1] == "gpt-6-sol"
     assert 'model_reasoning_effort="medium"' in cmd and cmd[-2:] == ["--json", "-"]
     if os.name == "nt":
@@ -622,8 +623,90 @@ def test_codex_dry_run_sandbox_mode(env, monkeypatch, capsys, with_idb):
         assert "--dangerously-bypass-approvals-and-sandbox" not in command
         assert " -s workspace-write" in command
         assert subprocess.list2cmdline(["--add-dir", str(ws / "_local" / "state")]) in command
+        assert subprocess.list2cmdline(["--add-dir", str(ws / "_local" / "evidence" / "5")]) in command
         if os.name == "nt":
             assert 'windows.sandbox=' in command
+
+
+@pytest.fixture
+def codex_unit(tmp_path, monkeypatch):
+    class Context:
+        data = tmp_path / "_local"
+        state = data / "state"
+
+    c = Context()
+    c.state.mkdir(parents=True)
+    wt = tmp_path / "worktree"
+    wt.mkdir()
+    task = {"repo": "ac3ds-re", "issue": 5, "provider": "codex", "state": "dispatched",
+            "worker": "gpt-6-sol", "effort": "medium", "worktree": str(wt), "idb": None}
+    monkeypatch.setattr(orch, "Ctx", lambda: c)
+    monkeypatch.setattr(orch, "need_repo", lambda *_: {})
+    monkeypatch.setattr(orch, "get_task", lambda *_: task)
+    monkeypatch.setattr(orch, "update_task", lambda _c, _key, **fields: task.update(fields))
+    monkeypatch.setattr(orch, "find_codex", lambda: "codex")
+    return c, wt, task
+
+
+@pytest.mark.parametrize("repo,name", [("ac3ds-re", "5"), ("derived", "derived-5")])
+def test_codex_evidence_dir_name(codex_unit, repo, name):
+    c, _, _ = codex_unit
+    assert orch.evidence_dir(c, repo, 5) == c.data / "evidence" / name
+
+
+@pytest.mark.parametrize("with_idb", [False, True])
+def test_codex_resume_uses_last_log_and_message_file(codex_unit, monkeypatch, tmp_path, capsys, with_idb):
+    c, wt, task = codex_unit
+    previous = tmp_path / "previous.jsonl"
+    previous.write_text(codex_jsonl("前の返答"), encoding="utf-8")
+    task["codex_log"] = str(previous)
+    if with_idb:
+        task["idb"] = {"path": str(tmp_path / "work.i64")}
+        states = iter([{"HEAD": "before"}, {"HEAD": "after"}])
+        monkeypatch.setattr(orch, "git_launch_state", lambda *_: next(states))
+    message = tmp_path / "message.txt"
+    message.write_text("続きの依頼\n", encoding="utf-8")
+    fc = use_codex(monkeypatch, codex_jsonl("続きの返答"))
+    assert orch.main(["codex", "5", "--resume", "--message-file", str(message)]) == 0
+    cmd, cwd, prompt = fc.calls[0]
+    assert cmd[:4] == ["codex", "exec", "resume", "t1"]
+    assert cwd == wt and prompt == "続きの依頼\n"
+    assert "-C" not in cmd and "-s" not in cmd and "--add-dir" not in cmd
+    assert cmd[-2:] == ["--json", "-"]
+    if with_idb:
+        assert "--dangerously-bypass-approvals-and-sandbox" in cmd
+        assert not any("sandbox_workspace_write.writable_roots" in arg for arg in cmd)
+        assert "HEAD:" in task["git_violation"]
+    else:
+        assert "--dangerously-bypass-approvals-and-sandbox" not in cmd
+        roots = next(arg.split("=", 1)[1] for arg in cmd if arg.startswith("sandbox_workspace_write.writable_roots="))
+        assert tomllib.loads("roots = " + roots)["roots"] == [str(c.state), str(c.data / "evidence" / "5")]
+        assert (c.data / "evidence" / "5").is_dir()
+        assert ('windows.sandbox="unelevated"' in cmd) == (os.name == "nt")
+    log = c.data / "logs" / "codex_ac3ds-re_5_1.jsonl"
+    assert log.read_text(encoding="utf-8") == fc.out
+    assert task["codex_log"] == str(log) and task["codex_finished_at"]
+    assert "続きの返答" in capsys.readouterr().out
+
+
+def test_codex_resume_accepts_stdin(codex_unit, monkeypatch):
+    _, _, task = codex_unit
+    previous = Path(task["worktree"]) / "previous.jsonl"
+    previous.write_text(codex_jsonl("前"), encoding="utf-8")
+    task["codex_log"] = str(previous)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("標準入力の依頼\n"))
+    fc = use_codex(monkeypatch, codex_jsonl("後"))
+    assert orch.main(["codex", "5", "--resume", "--message-file", "-"]) == 0
+    assert fc.calls[0][2] == "標準入力の依頼\n"
+
+
+def test_codex_resume_refuses_missing_log(codex_unit, monkeypatch, tmp_path, capsys):
+    message = tmp_path / "message.txt"
+    message.write_text("続き", encoding="utf-8")
+    fc = use_codex(monkeypatch, codex_jsonl("実行しない"))
+    assert orch.main(["codex", "5", "--resume", "--message-file", str(message)]) == 1
+    assert "ログが無い" in capsys.readouterr().err
+    assert not fc.calls
 
 
 def test_codex_idb_records_git_commit_violation(env, monkeypatch, capsys):
