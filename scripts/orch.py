@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime
+import hashlib
 import io
 import json
 import os
@@ -17,7 +18,7 @@ import subprocess
 import sys
 import time
 import tomllib
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -180,6 +181,73 @@ def update_task(c: Ctx, key: str, **kw) -> dict:
         tmp.write_text(json.dumps({"tasks": d}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
         os.replace(tmp, p)
         return d[key]
+
+
+def canonical_path(c: Ctx, build: str) -> Path:
+    return c.data / "builds" / build / "ida" / (build + ".i64")
+
+
+def canonical_state(c: Ctx) -> dict:
+    p = c.state / "canonical.json"
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+
+
+def record_canonical(c: Ctx, build: str) -> None:
+    path = canonical_path(c, build)
+    with path.open("rb") as f:
+        digest = hashlib.file_digest(f, "sha256").hexdigest()
+    c.state.mkdir(parents=True, exist_ok=True)
+    lock = FileLock(str(c.state / "canonical.json.lock"), timeout=30) if FileLock else None
+    with lock if lock else nullcontext():
+        state = canonical_state(c)
+        state.setdefault("builds", {})[build] = {"sha256": digest, "at": now()}
+        p = c.state / "canonical.json"
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
+        os.replace(tmp, p)
+
+
+def outside_status(c: Ctx) -> dict[str, list[str]]:
+    places = {"workspace": c.root, **{name: c.root / name for name in c.repos()}}
+    return {name: git(c, path, "status", "--porcelain").splitlines()
+            for name, path in places.items() if (path / ".git").exists()}
+
+
+def cleanup_task(c: Ctx, key: str, t: dict, keep: bool = False) -> None:
+    if keep:
+        update_task(c, key, cleanup="保持", cleanup_errors=[])
+        return
+    errors = []
+    repo_dir = c.root / t["repo"]
+    wt = Path(t["worktree"])
+    try:
+        git(c, repo_dir, "worktree", "remove", "--force", str(wt))
+    except OrchError as e:
+        errors.append(str(e))
+    if wt.exists():
+        for attempt in range(3):
+            try:
+                wt.rmdir()  # Git が中身を消した後の空フォルダだけを対象にする
+                break
+            except OSError as e:
+                if attempt == 2:
+                    errors.append("作業ツリーの空フォルダ: %s: %s" % (wt, e))
+                else:
+                    time.sleep(0.2)
+    try:
+        git(c, repo_dir, "branch", "-D", t["branch"])
+    except OrchError as e:
+        errors.append(str(e))
+    if t.get("idb"):
+        path = Path(t["idb"]["path"]).parent
+        if path.exists():
+            try:
+                shutil.rmtree(path)
+            except OSError as e:
+                errors.append("IDB 作業用コピー: %s: %s" % (path, e))
+    update_task(c, key, cleanup="警告" if errors else "完了", cleanup_errors=errors)
+    for error in errors:
+        print("警告: 片付け: " + error)
 
 
 def tkey(repo: str, n) -> str:
@@ -365,6 +433,7 @@ def run_export(c: Ctx, build: str, only: list[str] | None = None, commit: str | 
     with FileLock(str(c.state / ("idb-%s.lock" % build)), timeout=60):
         copy.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(canon, copy)
+        record_canonical(c, build)
     out = c.data / "builds" / build / "export"
     args = [py, str(script), "--idb", str(copy), "--build", build, "--out", str(out),
             "--symbols-commit", commit]
@@ -594,10 +663,11 @@ def cmd_dispatch(a) -> int:
     out = task_file(c, "dispatch", a.repo, a.issue)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text, encoding="utf-8", newline="\n")
+    outside_before = outside_status(c)
     update_task(c, key, repo=a.repo, issue=a.issue, title=issue.get("title", ""), branch=branch, worktree=str(wt),
                 worker=a.worker, provider=w.get("provider"), effort=a.effort or w.get("default_effort"),
                 idb=idb, state="dispatched", attempts=(old.get("attempts", 0) + 1) if old else 1,
-                dispatched_at=now(), usage_before=usage, stamped_head=None)
+                dispatched_at=now(), usage_before=usage, stamped_head=None, outside_before=outside_before)
     print(text)
     print("--- 依頼文を保存: %s（ブランチ %s、%s %s）" % (out, branch, a.worker, a.effort or w.get("default_effort")))
     return 0
@@ -607,7 +677,44 @@ def cmd_dispatch(a) -> int:
 def idb_open_files(path: Path) -> list[str]:
     if not path.parent.is_dir():
         return []
-    return sorted(p.name for p in path.parent.iterdir() if p.suffix.lower() in {".id0", ".id1", ".nam", ".til"})
+    return sorted(p.name for p in path.parent.iterdir() if p.suffix.lower() in {".id0", ".id1", ".id2", ".nam", ".til"})
+
+
+def canonical_checks(c: Ctx) -> list[tuple[str, int, str]]:
+    recorded = canonical_state(c).get("builds", {})
+    checks = []
+    for build in export_builds(c):
+        path = canonical_path(c, build)
+        if not path.is_file():
+            continue
+        open_files = idb_open_files(path)
+        with path.open("rb") as f:
+            digest = hashlib.file_digest(f, "sha256").hexdigest()
+        expected = recorded.get(build, {}).get("sha256")
+        problems = []
+        if expected and digest != expected:
+            problems.append("SHA256 が記録と違う: %s" % path)
+        if open_files:
+            problems.append("IDA の作業ファイル: %s" % ", ".join(open_files))
+        if not expected:
+            checks.append(("正本 IDB %s" % build, 0, "警告: SHA256 の記録が無い"))
+        else:
+            checks.append(("正本 IDB %s" % build, 1 if problems else 0, "\n".join(problems)))
+        if problems and not expected:
+            checks[-1] = (checks[-1][0], 1, "\n".join(problems + ["警告: SHA256 の記録が無い"]))
+    return checks
+
+
+def outside_checks(c: Ctx, before: dict, allow: bool) -> list[tuple[str, int, str]]:
+    current = outside_status(c)
+    checks = []
+    for name, rows in current.items():
+        added = sorted(set(rows) - set(before.get(name, [])))
+        if added:
+            label = "警告" if allow else "失敗"
+            checks.append(("作業ツリー外 %s" % name, 0 if allow else 1,
+                           label + ":\n" + "\n".join(added)))
+    return checks
 
 
 def save_task(c: Ctx, t: dict, message: str | None = None) -> bool:
@@ -958,6 +1065,8 @@ def cmd_stamp(a) -> int:
     if role == "analysis" and (wt / "tools" / "audit.py").exists():
         code, out = run_py(c, wt, wt / "tools" / "audit.py", [])
         checks.append(("audit", code, out))
+    checks.extend(canonical_checks(c))
+    checks.extend(outside_checks(c, t.get("outside_before", {}), a.allow_outside))
     n = t.get("attempts", 1)
     if commit_all(c, wt, "試行 %s: 仕上げ" % n):
         update_task(c, key, attempts=n + 1)  # save と同じく、コミットのたびに番号を進める
@@ -970,7 +1079,7 @@ def cmd_stamp(a) -> int:
             ["", "## symbols の差分"] + (sym or ["なし"]) + ["", "## 検査の結果"]
     for n, code, out in checks:
         lines.append("- %s: %s" % (n, "OK" if code == 0 else "失敗(%d)" % code))
-        if code != 0:
+        if out:
             lines += ["    " + x for x in out.splitlines()[-10:]]
     lines += ["", "## 報告", ".task/report.md: %s" % ("あり" if (wt / ".task" / "report.md").exists() else "なし")]
     text = "\n".join(lines) + "\n"
@@ -1097,6 +1206,8 @@ def import_canonical(c: Ctx, t: dict, short: str) -> str:
             if r.returncode != 0:
                 print("エラー: 取り込み失敗(%s): %s" % (b, (r.stderr or r.stdout).strip()[-300:]))
                 status = "取り込み失敗"
+            else:
+                record_canonical(c, b)
         finally:
             if lock and lock.is_locked:
                 lock.release()
@@ -1198,9 +1309,7 @@ def cmd_accept(a) -> int:
     if imp == "取り込み済み":
         refresh_export_after_accept(c, key, short)
     print("%s: 取り込み完了（%s、正本の取り込み: %s）" % (key, short, imp))
-    print("片付け（手動）:\n  git -C %s worktree remove --force %s" % (repo_dir, wt))
-    if t.get("idb"):
-        print("  rm -r %s" % Path(t["idb"]["path"]).parent)
+    cleanup_task(c, key, t, a.keep)
     return 1 if imp == "取り込み失敗" else 0
 
 
@@ -1221,6 +1330,7 @@ def cmd_reject(a) -> int:
         gh_run(["pr", "comment", str(t["pr"]), "--repo", slug, "--body", comment])
         gh_run(["pr", "close", str(t["pr"]), "--repo", slug, "--delete-branch"])
     update_task(c, key, state="rejected", rejected_at=now(), reject_reason=a.reason, usage_after=read_usage(c))
+    cleanup_task(c, key, t, a.keep)
     print("%s: 却下" % key)
     return 0
 
@@ -1349,12 +1459,15 @@ def main(argv=None) -> int:
     s.add_argument("--message-file")
     s = add("stamp", cmd_stamp)
     s.add_argument("issue", type=int)
+    s.add_argument("--allow-outside", action="store_true")
     s = add("accept", cmd_accept, dry=True)
     s.add_argument("issue", type=int)
     s.add_argument("--scores", required=True)
+    s.add_argument("--keep", action="store_true")
     s = add("reject", cmd_reject, dry=True)
     s.add_argument("issue", type=int)
     s.add_argument("--reason", required=True)
+    s.add_argument("--keep", action="store_true")
     a = p.parse_args(argv)
     try:
         return a.f(a)

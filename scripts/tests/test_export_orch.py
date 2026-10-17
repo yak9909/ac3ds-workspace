@@ -1,4 +1,5 @@
 import json
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,7 +19,8 @@ def context(tmp_path):
     ida.mkdir(parents=True)
     (ida / "one.i64").write_bytes(b"canonical")
     (data / "state").mkdir()
-    return SimpleNamespace(root=root, data=data, state=data / "state", local={"idalib_python": "fake-python"})
+    return SimpleNamespace(root=root, data=data, state=data / "state", local={"idalib_python": "fake-python"},
+                           repos=lambda: {"ac3ds-re": {"role": "analysis"}})
 
 
 def test_export_copy_unlock_command_and_state(tmp_path, monkeypatch):
@@ -47,6 +49,89 @@ def test_export_copy_unlock_command_and_state(tmp_path, monkeypatch):
     assert calls[0][1].endswith("export_all.py")
     assert calls[1][-4:] == ["--only", "foo", "--only", "bar"]
     assert orch.export_state(c)["builds"]["one"]["commit"] == "def"
+    assert orch.canonical_state(c)["builds"]["one"]["sha256"] == hashlib.sha256(b"canonical").hexdigest()
+
+
+def test_canonical_checks_hash_and_ida_files(tmp_path):
+    c = context(tmp_path)
+    orch.record_canonical(c, "one")
+    assert all(code == 0 for _, code, _ in orch.canonical_checks(c))
+    ida = c.data / "builds" / "one" / "ida"
+    (ida / "one.i64").write_bytes(b"changed")
+    (ida / "one.id2").write_bytes(b"")
+    checks = orch.canonical_checks(c)
+    assert checks[0][1] == 1
+    assert "SHA256" in checks[0][2] and "one.id2" in checks[0][2]
+
+
+def test_canonical_unrecorded_warning_but_open_file_fails(tmp_path):
+    c = context(tmp_path)
+    assert orch.canonical_checks(c)[0][1] == 0
+    assert "警告" in orch.canonical_checks(c)[0][2]
+    (c.data / "builds" / "one" / "ida" / "one.id0").write_bytes(b"")
+    assert orch.canonical_checks(c)[0][1] == 1
+
+
+def test_outside_status_added_and_allowed(tmp_path, monkeypatch):
+    c = context(tmp_path)
+    (c.root / ".git").mkdir()
+    (c.root / "ac3ds-re" / ".git").mkdir()
+    statuses = {"workspace": [" M tracked.txt"], "ac3ds-re": ["?? new.txt"]}
+    monkeypatch.setattr(orch, "git", lambda _, path, *args: "\n".join(statuses[path.name if path != c.root else "workspace"]))
+    before = orch.outside_status(c)
+    statuses["ac3ds-re"].append(" M other.txt")
+    failed = orch.outside_checks(c, before, False)
+    allowed = orch.outside_checks(c, before, True)
+    assert len(failed) == 1 and failed[0][1] == 1 and "other.txt" in failed[0][2]
+    assert allowed[0][1] == 0 and "警告" in allowed[0][2]
+
+
+def test_cleanup_success_and_keep(tmp_path, monkeypatch):
+    c = context(tmp_path)
+    c.root.joinpath("ac3ds-re").mkdir(exist_ok=True)
+    wt = c.data / "worktrees" / "ac3ds-re" / "5"
+    wt.mkdir(parents=True)
+    idb = c.data / "builds" / "one" / "ida" / "work" / "5" / "one.i64"
+    idb.parent.mkdir(parents=True)
+    idb.write_bytes(b"work")
+    task = {"repo": "ac3ds-re", "worktree": str(wt), "branch": "task/5-test", "idb": {"path": str(idb)}}
+    calls = []
+    def fake_git(_, __, *args):
+        calls.append(args)
+        if args[0] == "worktree":
+            wt.rmdir()
+    monkeypatch.setattr(orch, "git", fake_git)
+    orch.cleanup_task(c, "task", task, keep=True)
+    assert wt.exists() and idb.exists() and not calls
+    orch.cleanup_task(c, "task", task)
+    assert not wt.exists() and not idb.parent.exists()
+    assert calls == [("worktree", "remove", "--force", str(wt)), ("branch", "-D", "task/5-test")]
+    assert orch.load_tasks(c)["task"]["cleanup"] == "完了"
+
+
+def test_cleanup_empty_directory_retry_and_warning(tmp_path, monkeypatch):
+    c = context(tmp_path)
+    wt = c.data / "worktrees" / "ac3ds-re" / "5"
+    wt.mkdir(parents=True)
+    task = {"repo": "ac3ds-re", "worktree": str(wt), "branch": "task/5-test", "idb": None}
+    monkeypatch.setattr(orch, "git", lambda *args: None)
+    original = Path.rmdir
+    attempts = []
+    def flaky(path):
+        attempts.append(path)
+        if len(attempts) == 1:
+            raise PermissionError("locked")
+        return original(path)
+    monkeypatch.setattr(Path, "rmdir", flaky)
+    monkeypatch.setattr(orch.time, "sleep", lambda _: None)
+    orch.cleanup_task(c, "task", task)
+    assert len(attempts) == 2 and not wt.exists()
+    assert orch.load_tasks(c)["task"]["cleanup"] == "完了"
+    wt.mkdir(parents=True)
+    monkeypatch.setattr(Path, "rmdir", lambda _: (_ for _ in ()).throw(PermissionError("locked")))
+    orch.cleanup_task(c, "task", task)
+    assert orch.load_tasks(c)["task"]["cleanup"] == "警告"
+    assert "locked" in orch.load_tasks(c)["task"]["cleanup_errors"][0]
 
 
 def test_changed_function_names(tmp_path, monkeypatch):

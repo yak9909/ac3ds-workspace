@@ -306,6 +306,33 @@ def test_stamp_summary(env, capsys):
     assert "by: sonnet-5.5" in next((wt / "findings").rglob("ACNL-F*.md")).read_text(encoding="utf-8")
 
 
+def test_stamp_rejects_changed_canonical_and_open_file(env, capsys):
+    ws, _, _, _ = ready(env)
+    c = orch.Ctx()
+    orch.record_canonical(c, "acnl_jpn_v15")
+    ida = ws / "_local" / "builds" / "acnl_jpn_v15" / "ida"
+    (ida / "acnl_jpn_v15.i64").write_bytes(b"changed")
+    (ida / "acnl_jpn_v15.id1").write_bytes(b"")
+    assert run("stamp", "5") == 0
+    assert not tasks(ws)["ac3ds-re#5"]["stamp_ok"]
+    out = capsys.readouterr().out
+    assert "SHA256" in out and "acnl_jpn_v15.id1" in out
+
+
+def test_stamp_outside_change_can_be_allowed(env, capsys):
+    ws, _, _, _ = ready(env)
+    main = ws / "ac3ds-re"
+    # 直下の未追跡ファイルは既定で無視されるので、追跡済みのファイルを変える。
+    outside = main / ".gitignore"
+    outside.write_text(outside.read_text(encoding="utf-8") + "\n# worker change\n", encoding="utf-8")
+    assert run("stamp", "5") == 0
+    assert not tasks(ws)["ac3ds-re#5"]["stamp_ok"]
+    assert ".gitignore" in capsys.readouterr().out
+    assert run("stamp", "5", "--allow-outside") == 0
+    assert tasks(ws)["ac3ds-re#5"]["stamp_ok"]
+    assert "警告" in capsys.readouterr().out
+
+
 def test_accept_order_errors(env):
     ws, fake, origin, wt = ready(env)
     assert run("accept", "5", "--scores", "a=5") == 1  # stamp 前
