@@ -328,6 +328,78 @@ def periodic(c: Ctx) -> dict:
         return {}
 
 
+def export_state(c: Ctx) -> dict:
+    p = c.state / "export.json"
+    try:
+        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    except ValueError:
+        return {}
+
+
+def export_builds(c: Ctx) -> list[str]:
+    p = c.root / DEFAULT_REPO / "meta" / "builds.toml"
+    if not p.is_file():
+        raise OrchError("builds.toml が無い: %s" % p)
+    builds = tomllib.loads(p.read_text(encoding="utf-8")).get("builds", {})
+    return [name for name, info in builds.items() if "保管だけ" not in info.get("note", "")]
+
+
+def run_export(c: Ctx, build: str, only: list[str] | None = None, commit: str | None = None) -> dict:
+    if build not in export_builds(c):
+        raise OrchError("解析対象ではないビルド: %s" % build)
+    if FileLock is None:
+        raise OrchError("filelock が無いので正本の IDB を安全に写せない")
+    py = c.local.get("idalib_python")
+    if not py:
+        raise OrchError("workspace.local.toml に idalib_python が無い")
+    repo = c.root / DEFAULT_REPO
+    script = repo / "tools" / "sync" / "export_all.py"
+    if not script.is_file():
+        raise OrchError("書き出しの道具が無い: %s" % script)
+    canon = c.data / "builds" / build / "ida" / (build + ".i64")
+    if not canon.is_file():
+        raise OrchError("正本の IDB が無い: %s" % canon)
+    commit = commit or git(c, repo, "rev-parse", "main").strip()
+    copy = canon.parent / "export-work" / canon.name
+    c.state.mkdir(parents=True, exist_ok=True)
+    with FileLock(str(c.state / ("idb-%s.lock" % build)), timeout=60):
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(canon, copy)
+    out = c.data / "builds" / build / "export"
+    args = [py, str(script), "--idb", str(copy), "--build", build, "--out", str(out),
+            "--symbols-commit", commit]
+    for name in only or []:
+        args += ["--only", name]
+    started = time.monotonic()
+    r = subprocess.run(args, cwd=str(repo), env=tool_env(c), capture_output=True,
+                       text=True, encoding="utf-8", errors="replace")
+    if r.returncode:
+        raise OrchError("書き出し失敗(%s): %s" % (build, (r.stderr or r.stdout).strip()[-500:]))
+    elapsed = round(time.monotonic() - started, 3)
+    with FileLock(str(c.state / "export.json.lock"), timeout=30):
+        state = export_state(c)
+        old = state.setdefault("builds", {}).get(build, {})
+        finished_at = now()
+        entry = {"commit": commit, "at": finished_at, "mode": "partial" if only else "full", "seconds": elapsed,
+                 "full_at": old.get("full_at") if only else finished_at}
+        state["builds"][build] = entry
+        p = c.state / "export.json"
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
+        os.replace(tmp, p)
+    return entry
+
+
+def cmd_export(a) -> int:
+    c = Ctx()
+    builds = [a.build] if a.build else export_builds(c)
+    commit = git(c, c.root / DEFAULT_REPO, "rev-parse", "main").strip()
+    for build in builds:
+        entry = run_export(c, build, a.only, commit)
+        print("%s: 書き出し完了（%s、%s 秒）" % (build, entry["mode"], entry["seconds"]))
+    return 0
+
+
 def cmd_status(a) -> int:
     c = Ctx()
     ts = load_tasks(c)
@@ -383,6 +455,11 @@ def cmd_start(a) -> int:
             continue
         age = (datetime.datetime.now().astimezone() - datetime.datetime.fromisoformat(last)).days
         print("%s: %s（%d日前）%s" % (name, last, age, " ← 間が空いた" if age >= days else ""))
+    for build in export_builds(c):
+        full_at = export_state(c).get("builds", {}).get(build, {}).get("full_at")
+        age = (datetime.datetime.now().astimezone() - datetime.datetime.fromisoformat(full_at)).days if full_at else None
+        print("全関数の書き出し %s: %s%s" % (build, full_at or "未実施",
+              " ← 作り直す（python scripts/orch.py export --build %s）" % build if age is None or age >= 7 else ""))
     mirror(c)
     return 0
 
@@ -427,6 +504,24 @@ def pick_build(c: Ctx, scope: str) -> str:
         if b.get("scope") == scope and "保管だけ" not in b.get("note", ""):
             return n
     raise OrchError("スコープ %s のビルドが builds.toml に無い" % scope)
+
+
+def dispatch_export_line(c: Ctx, build: str) -> str:
+    entry = export_state(c).get("builds", {}).get(build)
+    if not entry or not (c.data / "builds" / build / "export" / "index.txt").is_file():
+        return ""
+    commit = entry["commit"]
+    line = "書き出し: %s（索引 index.txt、元の commit %s）" % (
+        c.data / "builds" / build / "export", commit)
+    accepted = [t for t in load_tasks(c).values() if t.get("state") == "accepted"
+                and t.get("idb_import") == "取り込み済み" and build in t.get("symbols_builds", [])
+                and t.get("merge_commit")]
+    if accepted:
+        latest = max(accepted, key=lambda t: t.get("accepted_at", ""))["merge_commit"]
+        if not latest.startswith(commit) and not commit.startswith(latest) and git_ok(
+                c, c.root / DEFAULT_REPO, "merge-base", "--is-ancestor", commit, latest):
+            line += "。書き出しは %s 時点。以後に変わった名前は symbols を見る" % commit
+    return line
 
 
 def cmd_dispatch(a) -> int:
@@ -486,12 +581,16 @@ def cmd_dispatch(a) -> int:
     goal = sec.get("目的と完了条件", "").strip() or issue.get("title", "")
     if sec.get("対象"):
         goal += "\n  対象: " + sec["対象"].strip()
+    export_line = ""
+    if role == "analysis" and scope in SCOPES:
+        export_line = dispatch_export_line(c, pick_build(c, scope))
+    tools = "、".join(x for x in (a.tools, export_line) if x)
     text = tpl.read_text(encoding="utf-8").format(
         repo=a.repo, goal=goal, worktree=str(wt),
         idb_line=("、IDB の作業用コピー %s" % idb["path"]) if idb else "",
         materials=sec.get("関係する資料", "").strip() or "なし",
         precheck=Path(a.precheck).read_text(encoding="utf-8").strip() if a.precheck else "なし",
-        tools_line=("- 道具: %s" % a.tools) if a.tools else "")
+        tools_line=("- 道具: %s" % tools) if tools else "")
     out = task_file(c, "dispatch", a.repo, a.issue)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text, encoding="utf-8", newline="\n")
@@ -1004,6 +1103,39 @@ def import_canonical(c: Ctx, t: dict, short: str) -> str:
     return status
 
 
+def changed_function_names(c: Ctx, repo: Path, commit: str) -> dict[str, list[str]]:
+    """取り込んだ merge commit の第一親と比較し、追加・改名・型変更後の関数名を返す。"""
+    paths = git(c, repo, "diff", "--name-only", commit + "^", commit, "--", "symbols").splitlines()
+    result: dict[str, list[str]] = {}
+    for path in paths:
+        parts = path.split("/")
+        if len(parts) != 3 or parts[0] != "symbols" or parts[2] != "functions.csv":
+            continue
+        def rows(rev):
+            src = git(c, repo, "show", rev + ":" + path, check=False)
+            return {row["address"]: row for row in csv.DictReader(io.StringIO(src)) if row.get("address")}
+        old, new = rows(commit + "^"), rows(commit)
+        names = {row["name"] for address, row in new.items() if row.get("name") and
+                 (address not in old or any(row.get(k) != old[address].get(k) for k in
+                  ("name", "prototype", "type")))}
+        if names:
+            result[parts[1]] = sorted(names)
+    return result
+
+
+def refresh_export_after_accept(c: Ctx, key: str, commit: str) -> None:
+    try:
+        changed = changed_function_names(c, c.root / DEFAULT_REPO, commit)
+        for build, names in changed.items():
+            if not (c.data / "builds" / build / "export" / "index.txt").is_file():
+                raise OrchError("%s の全体の書き出しが無い" % build)
+            run_export(c, build, names, commit)
+        update_task(c, key, export_refresh="完了" if changed else "対象なし")
+    except (OrchError, OSError, ValueError, subprocess.SubprocessError) as e:
+        print("警告: 書き出しの部分更新に失敗: %s" % e)
+        update_task(c, key, export_refresh="失敗", export_error=str(e))
+
+
 def cmd_accept(a) -> int:
     c = Ctx()
     need_repo(c, a.repo)
@@ -1063,6 +1195,8 @@ def cmd_accept(a) -> int:
     imp = import_canonical(c, t, short) if t.get("symbols_builds") else "不要"
     update_task(c, key, state="accepted", accepted_at=now(), scores=scores, idb_import=imp, merge_commit=short,
                 usage_after=read_usage(c))
+    if imp == "取り込み済み":
+        refresh_export_after_accept(c, key, short)
     print("%s: 取り込み完了（%s、正本の取り込み: %s）" % (key, short, imp))
     print("片付け（手動）:\n  git -C %s worktree remove --force %s" % (repo_dir, wt))
     if t.get("idb"):
@@ -1181,6 +1315,9 @@ def main(argv=None) -> int:
     s = add("setup-github", cmd_setup_github, repo=False, dry=True)
     s.add_argument("repo")
     add("start", cmd_start, repo=False)
+    s = add("export", cmd_export, repo=False)
+    s.add_argument("--build")
+    s.add_argument("--only", nargs="+", default=[])
     add("status", cmd_status, repo=False)
     add("wrapup", cmd_wrapup, repo=False)
     add("weekly", cmd_weekly)

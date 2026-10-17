@@ -104,6 +104,15 @@ if (-not (Test-Path -LiteralPath $VenvPy)) {
 }
 Run $VenvPy @('-m', 'pip', 'install', '--quiet', '--disable-pip-version-check', '-r', (Join-Path $Root 'scripts/requirements.txt'))
 
+# symbols の CSV は行単位で統合する（Git 設定は同じ値で上書きするので冪等）。
+if (($Only.Count -eq 0 -or $Only -contains 'ac3ds-re') -and
+    (Test-Path -LiteralPath (Join-Path $Root 'ac3ds-re/.git'))) {
+    $MergePy = [IO.Path]::GetFullPath($VenvPy).Replace('\', '/')
+    $Driver = '"' + $MergePy + '" tools/sync/merge_symbols.py "%O" "%A" "%B" "%P" --marker-size %L'
+    Run $Git @('-C', (Join-Path $Root 'ac3ds-re'), 'config', 'merge.ac3ds-symbols.driver', $Driver)
+    Run $Git @('-C', (Join-Path $Root 'ac3ds-re'), 'config', 'merge.ac3ds-symbols.name', 'ac3ds symbols CSV merge')
+}
+
 # 7. 外部ツールとスキルの写し
 if (-not $SkipTools) { Run $VenvPy @((Join-Path $Root 'scripts/fetch_tools.py')) }
 Run $VenvPy @((Join-Path $Root 'scripts/sync_skills.py'))
