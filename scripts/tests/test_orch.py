@@ -52,6 +52,9 @@ class FakeGh:
             raise orch.GhError("gh %s: 試験の失敗" % " ".join(a[:2]))
         if a[:2] == ["issue", "view"]:
             return json.dumps(self.issue)
+        if a[:2] == ["issue", "list"]:
+            return json.dumps([{"number": 5, "title": self.issue["title"], "body": self.issue["body"],
+                                "labels": self.issue["labels"]}])
         if a[:2] == ["api", "repos/o/ac3ds-re/issues/5"]:
             return json.dumps(self.issue_api)
         if a[:2] == ["pr", "create"]:

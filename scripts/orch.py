@@ -23,6 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import audit  # noqa: E402
+import capacity  # noqa: E402
 import sync_skills  # noqa: E402
 import wslib  # noqa: E402
 
@@ -276,6 +277,52 @@ def read_usage(c: Ctx):
         return None
 
 
+def capacity_reports(c: Ctx, extra_issue=None) -> dict:
+    issues = []
+    for repo in c.repos():
+        raw = gh_run(["issue", "list", "--repo", repo_slug(c, repo), "--state", "open", "--limit", "100",
+                      "--json", "number,title,body,labels"])
+        try:
+            listed = json.loads(raw)
+        except ValueError as e:
+            raise OrchError("open Issue の一覧が JSON でない: %s" % repo) from e
+        for item in listed:
+            item["repo"] = repo
+            issues.append(item)
+    if extra_issue and not any(i["repo"] == extra_issue["repo"] and i["number"] == extra_issue["number"] for i in issues):
+        issues.append(extra_issue)
+    tasks = load_tasks(c)
+    usage = capacity.read_claude_usage(c.state)
+    current = datetime.datetime.now(datetime.timezone.utc)
+    limits = c.workers.get("limits", {})
+    return {
+        provider: capacity.calculate(
+            provider, issues, tasks, c.workers.get("workers", {}), limits,
+            usage.get("five_hour_used_percent") if provider == "claude" else None,
+            usage.get("resets_at") if provider == "claude" else None, current,
+            capacity.codex_limit_until(c.data / "logs", current) if provider == "codex" else None)
+        for provider in ("claude", "codex")
+    }
+
+
+def cmd_capacity(a) -> int:
+    c = Ctx()
+    for provider, report in capacity_reports(c).items():
+        fmt = lambda x: "不明" if x is None else "%.1f%%" % x
+        print("%s: 使用率 %s、余裕 %s、1つ分の消費 %.1f%%、推奨 %d" % (
+            provider, fmt(report["usage"]), fmt(report["headroom"]), report["cost"], report["recommended"]))
+        for model, cost in report["model_costs"].items():
+            print("  %s: %.1f%%" % (model, cost))
+        for issue in report["candidates"]:
+            print("  候補 %s#%s %s" % (issue["repo"], issue["number"], issue.get("title", "")))
+        for overlap in report["overlaps"]:
+            print("  重複 %s#%s と %s: %s" % (overlap["repo"], overlap["number"], ", ".join(overlap["with"]),
+                                       ", ".join("0x%X" % n for n in overlap["addresses"])))
+        if report["limit_until"]:
+            print("  usage limit のリセット: %s" % report["limit_until"].isoformat())
+    return 0
+
+
 # ---------- Git 作業 ----------
 def commit_all(c: Ctx, wt: Path, msg: str) -> bool:
     git(c, wt, "add", "-A")
@@ -479,6 +526,44 @@ def cmd_status(a) -> int:
     return 0
 
 
+def stats_rows(tasks):
+    rows = {}
+    for t in tasks.values():
+        model = t.get("worker")
+        if not model:
+            continue
+        row = rows.setdefault(model, {"count": 0, "accepted": 0, "rejected": 0,
+                                      "attempts": 0, "violations": {}, "duration_hours": []})
+        row["count"] += 1
+        state = t.get("state")
+        if state in ("accepted", "rejected"):
+            row[state] += 1
+        row["attempts"] += int(t.get("attempts") or 0)
+        for key, value in t.items():
+            if value and (key.endswith("_violation") or key == "violations"):
+                row["violations"][key] = row["violations"].get(key, 0) + 1
+        start = capacity.instant(t.get("dispatched_at"))
+        end = capacity.instant(t.get("accepted_at") or t.get("rejected_at") or t.get("codex_finished_at"))
+        if start and end and end >= start:
+            row["duration_hours"].append((end - start).total_seconds() / 3600)
+    return rows
+
+
+def cmd_stats(a) -> int:
+    rows = stats_rows(load_tasks(Ctx()))
+    if not rows:
+        print("台帳: タスクなし")
+    for model, row in sorted(rows.items()):
+        n = row["count"]
+        durations = row["duration_hours"]
+        violations = ", ".join("%s=%d" % item for item in sorted(row["violations"].items())) or "なし"
+        duration = "%.2f時間" % (sum(durations) / len(durations)) if durations else "不明"
+        print("%s: 件数 %d、合格 %d、却下 %d、合格率 %.1f%%、平均試行 %.2f、違反 %s、平均所要 %s" % (
+            model, n, row["accepted"], row["rejected"], row["accepted"] * 100 / n,
+            row["attempts"] / n, violations, duration))
+    return 0
+
+
 def cmd_start(a) -> int:
     c = Ctx()
     h = c.data / "orchestrator" / "handoff.md"
@@ -602,7 +687,7 @@ def cmd_dispatch(a) -> int:
     w = wks[a.worker]
     lim = c.workers.get("limits", {}).get("stop_at_used_percent", 80)
     usage = read_usage(c)
-    if usage is not None and usage >= lim and not a.ignore_limit:
+    if w.get("provider") == "claude" and usage is not None and usage >= lim and not a.ignore_limit:
         raise OrchError("5時間枠の使用率 %s%% が上限 %s%% 以上なので依頼しない（--ignore-limit で無視）" % (usage, lim))
     raw = gh_run(["api", "repos/%s/issues/%s" % (repo_slug(c, a.repo), a.issue)])
     try:
@@ -620,6 +705,16 @@ def cmd_dispatch(a) -> int:
         scope = next((lb["name"] for lb in issue.get("labels", []) if lb.get("name") in SCOPES), "")
     key = tkey(a.repo, a.issue)
     old = load_tasks(c).get(key)
+    if not a.ignore_limit and not (old and old.get("state") in ACTIVE):
+        provider = w.get("provider")
+        current_issue = dict(issue, repo=a.repo, number=a.issue)
+        report = capacity_reports(c, current_issue).get(provider)
+        if report:
+            active_count = sum(t.get("provider") == provider and t.get("state") in ACTIVE
+                               for t in load_tasks(c).values())
+            if active_count + 1 > report["recommended"]:
+                raise OrchError("%s の推奨並列数 %d を超える（稼働中 %d、--ignore-limit で無視）" % (
+                    provider, report["recommended"], active_count))
     repo_dir = c.root / a.repo
     wt = c.data / "worktrees" / a.repo / str(a.issue)
     branch = old["branch"] if old else "task/%s-%s" % (a.issue, short_slug(issue.get("title", "")))
@@ -667,7 +762,8 @@ def cmd_dispatch(a) -> int:
     update_task(c, key, repo=a.repo, issue=a.issue, title=issue.get("title", ""), branch=branch, worktree=str(wt),
                 worker=a.worker, provider=w.get("provider"), effort=a.effort or w.get("default_effort"),
                 idb=idb, state="dispatched", attempts=(old.get("attempts", 0) + 1) if old else 1,
-                dispatched_at=now(), usage_before=usage, stamped_head=None, outside_before=outside_before)
+                dispatched_at=now(), usage_before=usage, body=issue.get("body", ""),
+                stamped_head=None, outside_before=outside_before)
     print(text)
     print("--- 依頼文を保存: %s（ブランチ %s、%s %s）" % (out, branch, a.worker, a.effort or w.get("default_effort")))
     return 0
@@ -1429,6 +1525,8 @@ def main(argv=None) -> int:
     s.add_argument("--build")
     s.add_argument("--only", nargs="+", default=[])
     add("status", cmd_status, repo=False)
+    add("stats", cmd_stats, repo=False)
+    add("capacity", cmd_capacity, repo=False)
     add("wrapup", cmd_wrapup, repo=False)
     add("weekly", cmd_weekly)
     s = add("issue", cmd_issue)
