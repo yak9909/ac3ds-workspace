@@ -10,3 +10,13 @@ url = "https://github.com/3DSGuy/Project_CTR/releases/download/ctrtool-v1.3.0/ct
 sha256 = "8031dff3be72d0adb250fae1f969f27627e12a89ebc6dd074a15a75f87ddc949"
 exe = "ctrtool.exe"
 exe_sha256 = "79021f283b2199950eb22cf3c459806b9c8aaaf68f65c80100107d3454a1c224"
+
+[tools.ghidra]
+version = "12.1.4"
+purpose = "IDA と独立した解析（深い検証）と symbols の同期（段階2）。Java 21 以上が要る"
+source = "https://github.com/NationalSecurityAgency/ghidra/releases/tag/Ghidra_12.1.4_build"
+license = "Apache-2.0"
+url = "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.1.4_build/ghidra_12.1.4_PUBLIC_20260921.zip"
+sha256 = "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db"
+exe = "ghidra_12.1.4_PUBLIC/support/analyzeHeadless.bat"
+exe_sha256 = "dd7b9d17d32ed70a71df82a43a21cdaed6c4ce67064e30f8642c149f81c2ae07"
