@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime
+import glob
 import hashlib
 import io
 import json
@@ -26,6 +27,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import audit  # noqa: E402
 import capacity  # noqa: E402
+import usage_watch  # noqa: E402
 import sync_skills  # noqa: E402
 import wslib  # noqa: E402
 
@@ -117,6 +119,10 @@ def tool_env(c: Ctx) -> dict:
     d = c.data / "venv" / "tools" / ("Scripts" if os.name == "nt" else "bin")
     if d.is_dir():
         env["PATH"] = str(d) + os.pathsep + env.get("PATH", "")
+    # Git for Windows の全体の設定 core.fsmonitor=true だと、作業ツリーごとに常駐の処理が残り続ける
+    n = int(env.get("GIT_CONFIG_COUNT") or 0)
+    env.update({"GIT_CONFIG_COUNT": str(n + 1), "GIT_CONFIG_KEY_%d" % n: "core.fsmonitor",
+                "GIT_CONFIG_VALUE_%d" % n: "false"})
     return env
 
 
@@ -321,14 +327,14 @@ def capacity_reports(c: Ctx, extra_issue=None) -> dict:
     if extra_issue and not any(i["repo"] == extra_issue["repo"] and i["number"] == extra_issue["number"] for i in issues):
         issues.append(extra_issue)
     tasks = load_tasks(c)
-    usage = capacity.read_claude_usage(c.state)
+    usage = {provider: capacity.read_provider_usage(c.state, provider) for provider in ("claude", "codex")}
     current = datetime.datetime.now(datetime.timezone.utc)
     limits = c.workers.get("limits", {})
     return {
         provider: capacity.calculate(
             provider, issues, tasks, c.workers.get("workers", {}), limits,
-            usage.get("five_hour_used_percent") if provider == "claude" else None,
-            usage.get("resets_at") if provider == "claude" else None, current,
+            usage[provider].get("five_hour_used_percent"),
+            usage[provider].get("resets_at"), current,
             capacity.codex_limit_until(c.data / "logs", current) if provider == "codex" else None)
         for provider in ("claude", "codex")
     }
@@ -602,6 +608,7 @@ def cmd_stats(a) -> int:
 
 def cmd_start(a) -> int:
     c = Ctx()
+    usage_watch.collect(c.root)
     h = c.data / "orchestrator" / "handoff.md"
     print("== 引き継ぎメモ ==")
     if h.exists():
@@ -839,14 +846,15 @@ def dispatch_export_line(c: Ctx, build: str) -> str:
 
 def cmd_dispatch(a) -> int:
     c = Ctx()
+    usage_watch.collect(c.root)
     role = need_repo(c, a.repo).get("role", "analysis")
     wks = c.workers.get("workers", {})
     if a.worker not in wks:
         raise OrchError("workers.toml に無いワーカー: %s（%s）" % (a.worker, ", ".join(wks)))
     w = wks[a.worker]
     lim = c.workers.get("limits", {}).get("stop_at_used_percent", 80)
-    usage = read_usage(c)
-    if w.get("provider") == "claude" and usage is not None and usage >= lim and not a.ignore_limit:
+    usage = capacity.read_provider_usage(c.state, w.get("provider")).get("five_hour_used_percent")
+    if usage is not None and usage >= lim and not a.ignore_limit:
         raise OrchError("5時間枠の使用率 %s%% が上限 %s%% 以上なので依頼しない（--ignore-limit で無視）" % (usage, lim))
     raw = gh_run(["api", "repos/%s/issues/%s" % (repo_slug(c, a.repo), a.issue)])
     try:
@@ -1085,6 +1093,12 @@ def evidence_dir(c: Ctx, repo: str, issue: int) -> Path:
 
 def codex_cmd(c: Ctx, wt: Path, exe: str, model: str, effort: str, idb_path: str | None = None,
               evidence: Path | None = None, thread_id: str | None = None) -> list[str]:
+    python = str((c.root / "_local/venv/tools/Scripts/python.exe").resolve())
+    guard = str((c.root / "scripts/usage_guard.py").resolve())
+    command = subprocess.list2cmdline([python, guard, "--provider", "codex"])
+    hook = ('hooks.PostToolUse=[{matcher=".*",hooks=[{type="command",command='
+            + json.dumps(command, ensure_ascii=False) + ',timeout=10}]}]')
+    hook_args = ["--dangerously-bypass-hook-trust", "-c", hook]
     if thread_id:
         cmd = [exe, "exec", "resume", thread_id]
         if idb_path:
@@ -1094,7 +1108,7 @@ def codex_cmd(c: Ctx, wt: Path, exe: str, model: str, effort: str, idb_path: str
                 cmd += ["-c", 'windows.sandbox="unelevated"']
             roots = [str(c.state), str(evidence)]
             cmd += ["-c", "sandbox_workspace_write.writable_roots=" + json.dumps(roots, ensure_ascii=False)]
-        return cmd + ["-m", model, "-c", 'model_reasoning_effort="%s"' % effort, "--json", "-"]
+        return cmd + hook_args + ["-m", model, "-c", 'model_reasoning_effort="%s"' % effort, "--json", "-"]
     cmd = [exe, "exec", "-C", str(wt)]
     if idb_path:
         cmd += ["--dangerously-bypass-approvals-and-sandbox"]
@@ -1104,13 +1118,25 @@ def codex_cmd(c: Ctx, wt: Path, exe: str, model: str, effort: str, idb_path: str
             cmd += ["-c", 'windows.sandbox="unelevated"']
         cmd += ["--add-dir", str(c.state)]
         cmd += ["--add-dir", str(evidence)]
-    return cmd + ["-m", model, "-c", 'model_reasoning_effort="%s"' % effort, "--json", "-"]
+    return cmd + hook_args + ["-m", model, "-c", 'model_reasoning_effort="%s"' % effort, "--json", "-"]
+
+
+def real_pwsh_dir() -> str | None:
+    """ストア版 PowerShell の実体のフォルダ（新しい版）。PATH 上の実行エイリアスは、
+    Codex のサンドボックス（制限付きのトークン）からは起動できない（CreateProcessAsUserW の 5）。"""
+    found = glob.glob(r"C:\Program Files\WindowsApps\Microsoft.PowerShell_*_x64__*\pwsh.exe") if os.name == "nt" else []
+    ver = lambda p: [int(x) for x in re.findall(r"\d+", Path(p).parent.name.split("_")[1])]
+    return str(Path(max(found, key=ver)).parent) if found else None
 
 
 def run_codex(c: Ctx, cmd: list[str], cwd: Path, prompt: str) -> tuple[int, str, str]:
     """codex を起動し、終わるまで待つ。試験ではこの関数を差し替える。"""
+    env = child_env(c)
+    d = real_pwsh_dir()
+    if d:
+        env["PATH"] = d + os.pathsep + env.get("PATH", "")
     r = subprocess.run(cmd, cwd=str(cwd), input=prompt, capture_output=True, text=True, encoding="utf-8",
-                       errors="replace", env=child_env(c))
+                       errors="replace", env=env)
     return r.returncode, r.stdout, r.stderr
 
 

@@ -93,6 +93,7 @@ def test_stats_rows():
 
 
 def test_dispatch_rejects_capacity_before_work(monkeypatch, tmp_path):
+    monkeypatch.setattr(orch.usage_watch, "collect", lambda *_: {})
     ctx = SimpleNamespace(workers={"workers": {"gpt": {"provider": "codex"}}, "limits": {}},
                           state=tmp_path, root=tmp_path)
     monkeypatch.setattr(orch, "Ctx", lambda: ctx)

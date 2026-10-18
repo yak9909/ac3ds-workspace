@@ -731,6 +731,7 @@ def test_codex_dry_run_sandbox_mode(env, monkeypatch, capsys, with_idb):
 @pytest.fixture
 def codex_unit(tmp_path, monkeypatch):
     class Context:
+        root = tmp_path
         data = tmp_path / "_local"
         state = data / "state"
 

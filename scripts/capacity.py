@@ -152,11 +152,17 @@ def calculate(provider, issues, tasks, workers, limits, usage, reset_at, now, li
             "candidates": selected, "overlaps": overlaps, "limit_until": limit_until}
 
 
-def read_claude_usage(state):
+def read_provider_usage(state, provider):
     try:
-        return json.loads((state / "usage.json").read_text(encoding="utf-8")).get("claude", {})
+        from usage_watch import expire
+        data = json.loads((state / "usage.json").read_text(encoding="utf-8")).get(provider, {})
+        return expire(data, dt.datetime.now(dt.timezone.utc).timestamp()) if isinstance(data, dict) else {}
     except (OSError, ValueError, AttributeError):
         return {}
+
+
+def read_claude_usage(state):
+    return read_provider_usage(state, "claude")
 
 
 if __name__ == "__main__":

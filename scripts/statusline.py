@@ -25,12 +25,9 @@ def _get(d, *keys):
 
 
 def write_usage(root: Path, pct, resets_at) -> None:
-    p = root / "_local" / "state" / "usage.json"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    data = {"claude": {"five_hour_used_percent": pct, "resets_at": resets_at, "updated": int(time.time())}}
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
-    os.replace(tmp, p)
+    from usage_watch import update_usage
+    update_usage(root / "_local" / "state", {
+        "claude": {"five_hour_used_percent": pct, "resets_at": resets_at, "updated": int(time.time())}})
 
 
 FIVE_NAMES = ("five_hour", "fiveHour", "5h", "five_hours")
@@ -107,7 +104,7 @@ def render(raw: str, root: Path = ROOT) -> str:
         usage = "5h %.0f%%" % pct
         try:
             write_usage(root, pct, resets)
-        except OSError:
+        except Exception:
             usage += "（記録失敗）"
     else:
         usage = "5h 使用率: 取得不可"
