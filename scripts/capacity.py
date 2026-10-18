@@ -10,6 +10,7 @@ from pathlib import Path
 
 ACTIVE = {"dispatched", "saved", "stamped"}
 LEGACY = {"reanalyze", "consolidate"}
+EXCLUDED_LABELS = {"report", "blocked", "needs-user"}
 ADDRESS = re.compile(r"(?<![\w])0x[0-9a-fA-F]+\b")
 LIMIT_ERROR = re.compile(r"usage limit|rate limit|利用上限|使用上限", re.I)
 RESET = re.compile(r"(?:resets?\s*(?:at|in)?|reset_at|リセット(?:時刻)?)[^\d]{0,25}(\d{4}-\d\d-\d\d[T ]\d\d:\d\d(?::\d\d)?(?:Z|[+-]\d\d:?\d\d)?)", re.I)
@@ -40,6 +41,9 @@ def candidates(issues, tasks, share=0.3, max_parallel=3):
                 used.setdefault(addr, key)
     independent, overlaps = [], []
     for issue in issues:
+        labels = {x.get("name") if isinstance(x, dict) else x for x in issue.get("labels", [])}
+        if labels & EXCLUDED_LABELS:
+            continue
         if (issue["repo"], str(issue["number"])) in running:
             continue
         addr = addresses(issue.get("body", ""))

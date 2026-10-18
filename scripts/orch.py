@@ -262,6 +262,33 @@ def get_task(c: Ctx, repo: str, n) -> dict:
     return t
 
 
+def require_unpaused(t: dict) -> None:
+    if t.get("state") == "paused":
+        raise OrchError("保留中のタスク。先に unpause する")
+
+
+def cmd_pause(a) -> int:
+    c = Ctx()
+    t = get_task(c, a.repo, a.issue)
+    if t.get("state") not in ACTIVE:
+        raise OrchError("状態が %s。動いているタスクだけ pause できる" % t.get("state"))
+    key = tkey(a.repo, a.issue)
+    update_task(c, key, state="paused", paused_from=t["state"], pause_reason=a.reason, paused_at=now())
+    print("%s: 保留（%s）" % (key, a.reason))
+    return 0
+
+
+def cmd_unpause(a) -> int:
+    c = Ctx()
+    t = get_task(c, a.repo, a.issue)
+    if t.get("state") != "paused" or t.get("paused_from") not in ACTIVE:
+        raise OrchError("有効な保留状態でない: %s" % t.get("state"))
+    key = tkey(a.repo, a.issue)
+    update_task(c, key, state=t["paused_from"], paused_from=None, pause_reason=None, paused_at=None)
+    print("%s: 保留を解除（%s）" % (key, t["paused_from"]))
+    return 0
+
+
 def task_file(c: Ctx, kind: str, repo: str, n) -> Path:
     name = "%s.md" % n if repo == DEFAULT_REPO else "%s-%s.md" % (repo, n)
     return c.data / "orchestrator" / kind / name
@@ -522,7 +549,14 @@ def cmd_status(a) -> int:
     if not ts:
         print("台帳: タスクなし")
     for k, t in ts.items():
-        print("%s  %s  %s 試行%s PR=%s" % (k, t.get("state"), t.get("worker"), t.get("attempts"), t.get("pr") or "-"))
+        if t.get("state") != "paused":
+            print("%s  %s  %s 試行%s PR=%s" % (k, t.get("state"), t.get("worker"), t.get("attempts"), t.get("pr") or "-"))
+    paused = {k: t for k, t in ts.items() if t.get("state") == "paused"}
+    if paused:
+        print("== 保留中のタスク ==")
+        for k, t in paused.items():
+            print("%s  保留（%s、理由: %s）  %s 試行%s PR=%s" % (
+                k, t.get("paused_from"), t.get("pause_reason"), t.get("worker"), t.get("attempts"), t.get("pr") or "-"))
     return 0
 
 
@@ -580,6 +614,12 @@ def cmd_start(a) -> int:
     for k, t in act.items():
         print("%s  %s  %s  PR=%s" % (k, t["state"], t.get("worker"), t.get("pr") or "-"))
     if not act:
+        print("なし")
+    paused = {k: t for k, t in load_tasks(c).items() if t.get("state") == "paused"}
+    print("== 保留中のタスク ==")
+    for k, t in paused.items():
+        print("%s  %s  理由: %s" % (k, t.get("paused_from"), t.get("pause_reason")))
+    if not paused:
         print("なし")
     print("== open の Issue と PR ==")
     for repo in c.repos():
@@ -705,6 +745,8 @@ def cmd_dispatch(a) -> int:
         scope = next((lb["name"] for lb in issue.get("labels", []) if lb.get("name") in SCOPES), "")
     key = tkey(a.repo, a.issue)
     old = load_tasks(c).get(key)
+    if old:
+        require_unpaused(old)
     if not a.ignore_limit and not (old and old.get("state") in ACTIVE):
         provider = w.get("provider")
         current_issue = dict(issue, repo=a.repo, number=a.issue)
@@ -814,6 +856,7 @@ def outside_checks(c: Ctx, before: dict, allow: bool) -> list[tuple[str, int, st
 
 
 def save_task(c: Ctx, t: dict, message: str | None = None) -> bool:
+    require_unpaused(t)
     wt = Path(t["worktree"])
     key = tkey(t["repo"], t["issue"])
     if not wt.is_dir():
@@ -858,6 +901,7 @@ REPORT_HEADER = "（ワーカーの最終の返答をオーケストラが保存
 
 
 def require_active(t: dict) -> None:
+    require_unpaused(t)
     if t.get("state") not in ACTIVE:
         raise OrchError("状態が %s。動いているタスク（dispatched・saved・stamped）でだけ使う" % t.get("state"))
 
@@ -1015,6 +1059,7 @@ def cmd_codex(a) -> int:
     c = Ctx()
     need_repo(c, a.repo)
     t = get_task(c, a.repo, a.issue)
+    require_unpaused(t)
     key = tkey(a.repo, a.issue)
     if t.get("provider") != "codex":
         raise OrchError("台帳の provider が codex でない（%s）" % t.get("provider"))
@@ -1146,6 +1191,7 @@ def cmd_stamp(a) -> int:
     c = Ctx()
     role = need_repo(c, a.repo).get("role", "analysis")
     t = get_task(c, a.repo, a.issue)
+    require_unpaused(t)
     key = tkey(a.repo, a.issue)
     if not t.get("pr"):
         raise OrchError("PR が無い。先に save する")
@@ -1347,6 +1393,7 @@ def cmd_accept(a) -> int:
     c = Ctx()
     need_repo(c, a.repo)
     t = get_task(c, a.repo, a.issue)
+    require_unpaused(t)
     key = tkey(a.repo, a.issue)
     scores = parse_scores(a.scores)
     wt = Path(t["worktree"])
@@ -1402,6 +1449,10 @@ def cmd_accept(a) -> int:
     imp = import_canonical(c, t, short) if t.get("symbols_builds") else "不要"
     update_task(c, key, state="accepted", accepted_at=now(), scores=scores, idb_import=imp, merge_commit=short,
                 usage_after=read_usage(c))
+    changed_skills = git(c, repo_dir, "diff", "--name-only", "origin/main^", "origin/main", "--", "skills").strip()
+    if changed_skills or sync_skills.check(c.root):
+        for line in sync_skills.sync(c.root):
+            print(line)
     if imp == "取り込み済み":
         refresh_export_after_accept(c, key, short)
     print("%s: 取り込み完了（%s、正本の取り込み: %s）" % (key, short, imp))
@@ -1546,6 +1597,11 @@ def main(argv=None) -> int:
     s = add("save", cmd_save)
     s.add_argument("issue", type=int)
     s.add_argument("--message")
+    s = add("pause", cmd_pause)
+    s.add_argument("issue", type=int)
+    s.add_argument("--reason", required=True)
+    s = add("unpause", cmd_unpause)
+    s.add_argument("issue", type=int)
     s = add("report", cmd_report)
     s.add_argument("issue", type=int)
     s.add_argument("--from", dest="src", required=True)

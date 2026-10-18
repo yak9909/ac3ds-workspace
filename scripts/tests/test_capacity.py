@@ -33,6 +33,18 @@ def test_overlaps_and_legacy_share():
     assert overlaps[0]["number"] == 2 and overlaps[0]["addresses"] == [16]
 
 
+def test_candidates_exclude_report_blocked_and_needs_user():
+    issues = [dict(i) for i in ISSUES[:5]]
+    for issue, label in zip(issues[:3], ("report", "blocked", "needs-user")):
+        issue["labels"] = [{"name": label}]
+    issues[3]["labels"] = ["analysis"]
+    selected, overlaps = capacity.candidates(issues, {})
+    assert [i["number"] for i in selected] == [4, 5]
+    assert overlaps == []
+    result = capacity.calculate("codex", issues, {}, WORKERS, {}, None, None, NOW)
+    assert [i["number"] for i in result["candidates"]] == [4, 5]
+
+
 def test_hourly_rate_and_log_limit(tmp_path):
     tasks = {"one": {"worker": "sonnet", "usage_before": 10, "usage_after": 20,
                      "dispatched_at": NOW.isoformat(), "accepted_at": (NOW + dt.timedelta(hours=2)).isoformat()}}

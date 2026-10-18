@@ -374,6 +374,76 @@ def test_accept_full(env):
     assert not any(f.startswith(".task/") for f in files)
 
 
+def test_pause_unpause_and_refused_commands(env, capsys):
+    ws, _, _ = env
+    assert dispatch(env) == 0
+    assert run("pause", "5", "--reason", "深い検証待ち") == 0
+    task = tasks(ws)["ac3ds-re#5"]
+    assert task["state"] == "paused" and task["paused_from"] == "dispatched"
+    assert task["pause_reason"] == "深い検証待ち"
+    assert run("status") == 0
+    assert "保留" in capsys.readouterr().out
+    assert run("start") == 0
+    out = capsys.readouterr().out
+    assert "== 保留中のタスク ==" in out and "ac3ds-re#5" in out
+    assert "== 動いているタスク ==\nなし" in out
+    for args in (("save", "5"), ("stamp", "5"), ("accept", "5", "--scores", "a=5"),
+                 ("codex", "5")):
+        assert run(*args) == 1
+        assert "先に unpause" in capsys.readouterr().err
+    assert run("wrapup") == 0
+    assert tasks(ws)["ac3ds-re#5"]["state"] == "paused"
+    assert "動いているタスクなし" in capsys.readouterr().out
+    assert run("unpause", "5") == 0
+    task = tasks(ws)["ac3ds-re#5"]
+    assert task["state"] == "dispatched" and task["paused_from"] is None
+    assert run("pause", "5", "--reason", "再度保留") == 0
+    assert run("unpause", "5") == 0
+
+
+def test_paused_task_not_counted_for_dispatch(env, monkeypatch):
+    ws, fake, _ = env
+    assert dispatch(env) == 0
+    assert run("pause", "5", "--reason", "待機") == 0
+    original_gh = orch.gh_run
+    monkeypatch.setattr(orch, "gh_run", lambda args, input_text=None:
+                        "{}" if args[:2] == ["api", "repos/o/ac3ds-re/issues/6"]
+                        else original_gh(args, input_text))
+    monkeypatch.setattr(orch, "read_issue", lambda *args: dict(fake.issue))
+    monkeypatch.setattr(orch, "capacity_reports", lambda *args: {"claude": {"recommended": 1}})
+
+    class ReachedWorktree(Exception):
+        pass
+
+    def stop_before_git(*args, **kwargs):
+        raise ReachedWorktree
+
+    monkeypatch.setattr(orch, "git", stop_before_git)
+    with pytest.raises(ReachedWorktree):
+        run("dispatch", "6", "--worker", "sonnet-5.5")
+    assert tasks(ws)["ac3ds-re#5"]["state"] == "paused"
+
+
+@pytest.mark.parametrize("changed", [True, False])
+def test_accept_syncs_skills_after_merge(env, monkeypatch, changed):
+    ws, _, _ = env
+    ready(env)
+    assert run("stamp", "5") == 0
+    original_git = orch.git
+
+    def git_with_skills(c, cwd, *args, **kwargs):
+        if args == ("diff", "--name-only", "origin/main^", "origin/main", "--", "skills"):
+            return "skills/example/SKILL.md\n" if changed else ""
+        return original_git(c, cwd, *args, **kwargs)
+
+    monkeypatch.setattr(orch, "git", git_with_skills)
+    monkeypatch.setattr(orch.sync_skills, "check", lambda root: ["workspace skills mismatch"])
+    calls = []
+    monkeypatch.setattr(orch.sync_skills, "sync", lambda root: calls.append(root) or [])
+    assert run("accept", "5", "--scores", "a=5") == 0
+    assert calls == [ws]
+
+
 def test_reject(env):
     ws, fake, origin, wt = ready(env)
     assert run("reject", "5", "--reason", "根拠が足りない") == 0
