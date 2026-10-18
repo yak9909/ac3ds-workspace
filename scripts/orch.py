@@ -916,7 +916,10 @@ def cmd_dispatch(a) -> int:
         goal += "\n  対象: " + sec["対象"].strip()
     export_line = ""
     if role == "analysis" and scope in SCOPES:
-        export_line = dispatch_export_line(c, pick_build(c, scope))
+        try:
+            export_line = dispatch_export_line(c, pick_build(c, scope))
+        except OrchError:
+            pass  # 3ds など、ビルドの無いスコープには書き出しが無い
     tools = "、".join(x for x in (a.tools, export_line) if x)
     text = tpl.read_text(encoding="utf-8").format(
         repo=a.repo, goal=goal, worktree=str(wt),
