@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import re
 import sys
 import tomllib
+import zlib
 from pathlib import Path
 
 
@@ -15,6 +17,13 @@ IDENT = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*$")
 WORDS = re.compile(r"\b[A-Za-z_][A-Za-z_0-9]*\b")
 TYPE_MARKER = re.compile(r"^// type: ([A-Za-z_][A-Za-z_0-9]*)\s*$", re.M)
 FORBIDDEN = re.compile(r"\b(?:ACNL|HHD)-[A-Z]\d+\b|ac3ds-re|symbols[/\\]", re.I)
+CPP_KEYWORDS = set("""alignas alignof and and_eq asm auto bitand bitor bool break case catch
+char char16_t char32_t class compl const constexpr const_cast continue decltype default
+delete do double dynamic_cast else enum explicit export extern false float for friend goto
+if inline int long mutable namespace new noexcept not not_eq nullptr operator or or_eq
+private protected public register reinterpret_cast return short signed sizeof static
+static_assert static_cast struct switch template this thread_local throw true try typedef
+typeid typename union unsigned using virtual void volatile wchar_t while xor xor_eq""".split())
 
 
 def require_names(value: object, label: str) -> list[str]:
@@ -25,10 +34,12 @@ def require_names(value: object, label: str) -> list[str]:
     return value
 
 
-def read_config(repo: Path) -> tuple[str, Path, dict[str, list[str]]]:
-    config = tomllib.loads((repo / "game_api.toml").read_text(encoding="utf-8"))
-    if set(config) != {"build", "output", "functions", "globals", "types"}:
-        raise ValueError("game_api.toml の項目は build, output, functions, globals, types にしてください")
+def read_config(repo: Path, config_path: Path | None = None) -> tuple[str, Path, dict]:
+    # --config の相対パスは CLI の通常の規則どおり、現在のディレクトリを基準にする。
+    config = tomllib.loads((config_path if config_path is not None else repo / "game_api.toml").read_text(encoding="utf-8"))
+    required = {"build", "output", "functions", "globals", "types"}
+    if not required <= set(config) or set(config) - required - {"namespace", "hooks", "checks"}:
+        raise ValueError("一覧の項目は build, output, functions, globals, types（任意: namespace, hooks, checks）にしてください")
     build, output = config["build"], config["output"]
     if not isinstance(build, str) or not IDENT.fullmatch(build):
         raise ValueError("build が不正です")
@@ -38,7 +49,90 @@ def read_config(repo: Path) -> tuple[str, Path, dict[str, list[str]]]:
     if not destination.is_relative_to(repo.resolve()):
         raise ValueError("output はリポジトリ内にしてください")
     names = {key: require_names(config[key], key) for key in ("functions", "globals", "types")}
+    namespace = config.get("namespace", "")
+    if not isinstance(namespace, str) or (namespace and any(
+            not IDENT.fullmatch(part) or part in CPP_KEYWORDS for part in namespace.split("::"))):
+        raise ValueError("namespace は C++ の名前空間名にしてください（入れ子は ::）")
+    names["namespace"] = namespace
+    used = set(names["functions"] + names["globals"])
+    for label in ("hooks", "checks"):
+        entries = config.get(label, [])
+        if not isinstance(entries, list):
+            raise ValueError(f"{label} はテーブルの配列にしてください")
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != {"name", "function", "offset", "length"}:
+                raise ValueError(f"{label} の項目は name, function, offset, length にしてください")
+            for field in ("name", "function"):
+                if not isinstance(entry[field], str) or not IDENT.fullmatch(entry[field]):
+                    raise ValueError(f"{label}.{field} が不正です")
+            if entry["name"] in used:
+                raise ValueError(f"重複した出力名: {entry['name']}")
+            used.add(entry["name"])
+            if type(entry["offset"]) is not int or entry["offset"] < 0:
+                raise ValueError(f"{label}.offset は非負の整数にしてください")
+            if type(entry["length"]) is not int or not 4 <= entry["length"] <= 64:
+                raise ValueError(f"{label}.length は 4〜64 の整数にしてください")
+        names[label] = entries
     return build, destination, names
+
+
+def code_image(build: str, info: dict) -> bytes:
+    """展開場所の違いと base/update の同居を、ビルドのハッシュで解決する。"""
+    folder = ROOT / "_local/builds" / build
+    paths = sorted(folder.rglob("code.bin"))
+    if not paths:
+        raise ValueError(f"code.bin がありません: {build}")
+    for path in paths:
+        data = path.read_bytes()
+        if hashlib.sha256(data).hexdigest().lower() == info["code_sha256"].lower():
+            return data
+    raise ValueError(f"code.bin の SHA256 がビルドと一致しません: {build}")
+
+
+def code_layout(symbols: Path, info: dict) -> tuple[int, list[tuple[int, int]]]:
+    meta_path = symbols / "meta.toml"
+    meta = tomllib.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+    segments = meta.get("segments", info.get("segments", {}))
+
+    def number(value: int | str) -> int:
+        return int(value, 0) if isinstance(value, str) else int(value)
+
+    if "text" in segments:
+        ranges = sorted((number(bounds[0]), number(bounds[1]))
+                        for name, bounds in segments.items() if name != "bss")
+        return number(segments["text"][0]), ranges
+    # セグメントが無い古い書き出しでは、配置済みイメージの開始を仮定する。
+    print("警告: 配置情報が無いため code.bin は仮想番地 0x00100000 から始まると仮定します", file=sys.stderr)
+    return 0x00100000, []
+
+
+def check_lines(entry: dict, functions: dict, data: bytes, base: int,
+                ranges: list[tuple[int, int]]) -> list[str]:
+    name, function = entry["name"], entry["function"]
+    if function not in functions:
+        raise ValueError(f"見つからない関数: {function}")
+    row = functions[function]
+    start = int(row["address"], 0)
+    offset, length = entry["offset"], entry["length"]
+    if start < 0 or offset + length > int(row["size"], 0):
+        raise ValueError(f"関数の範囲外: {name}")
+    addr = (start & ~1) + offset
+    end, position = addr + length, addr - base
+    if position < 0 or position + length > len(data):
+        raise ValueError(f"code.bin の範囲外: {name}")
+    if ranges:
+        cursor = addr
+        for begin, stop in ranges:
+            if begin <= cursor < stop:
+                cursor = min(end, stop)
+                if cursor == end:
+                    break
+        if cursor != end:
+            raise ValueError(f"code.bin のセグメント範囲外: {name}")
+    crc = zlib.crc32(data[position:position + length])
+    return [f"inline constexpr std::uintptr_t {name}_addr = 0x{addr:08X};",
+            f"inline constexpr std::uint32_t {name}_len = {length};",
+            f"inline constexpr std::uint32_t {name}_crc32 = 0x{crc:08X};"]
 
 
 def read_symbols(folder: Path) -> dict[str, dict[str, str]]:
@@ -140,8 +234,8 @@ def function_lines(name: str, row: dict[str, str]) -> list[str]:
             f"inline constexpr std::uintptr_t {name}_addr = {addr};"]
 
 
-def generate(repo: Path) -> Path:
-    build, destination, wanted = read_config(repo)
+def generate(repo: Path, config_path: Path | None = None) -> Path:
+    build, destination, wanted = read_config(repo, config_path)
     builds = tomllib.loads((ROOT / "ac3ds-re/meta/builds.toml").read_text(encoding="utf-8"))["builds"]
     if build not in builds or "code_sha256" not in builds[build]:
         raise ValueError(f"不明なビルド: {build}")
@@ -159,9 +253,18 @@ def generate(repo: Path) -> Path:
     references = [functions[name]["prototype"] for name in wanted["functions"]]
     references += [globals_[name]["type"] for name in wanted["globals"]]
     order = selected_types(definitions, kinds, wanted["types"], references)
+    checks = wanted["hooks"] + wanted["checks"]
+    verification = []
+    if checks:
+        data = code_image(build, builds[build])
+        base, ranges = code_layout(symbols, builds[build])
+        for entry in checks:
+            verification.extend(check_lines(entry, functions, data, base, ranges) + [""])
     lines = ["// 生成物。編集しない（export_game_api.py が作り直す）。",
              f"// build: {build}", f"// code SHA256: {builds[build]['code_sha256']}",
              "#pragma once", "#include <cstdint>", ""]
+    if wanted["namespace"]:
+        lines.extend([f"namespace {wanted['namespace']} {{", ""])
     declarations = [f"{kinds[name]} {name};" for name in order if kinds.get(name) in ("struct", "class", "union")]
     if declarations:
         lines.extend(declarations + [""])
@@ -179,6 +282,9 @@ def generate(repo: Path) -> Path:
         lines.append(f"using {name}_t = {typ};")
         lines.append(f"inline constexpr std::uintptr_t {name}_addr = {address(globals_[name])};")
         lines.append("")
+    lines.extend(verification)
+    if wanted["namespace"]:
+        lines.append(f"}} // namespace {wanted['namespace']}")
     result = "\n".join(lines).rstrip() + "\n"
     if FORBIDDEN.search(result):
         raise ValueError("生成したヘッダーに解析固有の情報が含まれています")
@@ -190,9 +296,10 @@ def generate(repo: Path) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True, type=Path, help="game_api.toml を置いた派生リポジトリ")
+    parser.add_argument("--config", type=Path, help="一覧のパス（既定: <repo>/game_api.toml）")
     args = parser.parse_args()
     try:
-        print(generate(args.repo.resolve()))
+        print(generate(args.repo.resolve(), args.config))
     except (OSError, KeyError, ValueError, tomllib.TOMLDecodeError) as exc:
         print(f"エラー: {exc}", file=sys.stderr)
         return 1

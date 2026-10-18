@@ -1,7 +1,10 @@
 # 派生リポジトリの直下に game_api.toml として置く。
+# spec/game_api.toml に置く場合は --config <repo>/spec/game_api.toml を指定する。
 # output は派生リポジトリからの相対パス。
 build = "acnl_jpn_v15"
 output = "include/game_api.h"
+# 省略すると従来どおりグローバル名前空間。入れ子は "game::api" と書ける。
+namespace = "game"
 
 functions = [
   "ChatWindow_ConsumeInputResult",
@@ -10,3 +13,18 @@ functions = [
 ]
 globals = ["g_RoomFlagTable"]
 types = ["ItemID"]
+
+# 照合範囲は関数内。offset は非負、length は 4〜64 バイト。
+# Thumb の下位ビットは番地計算時に除く。出力は番地・長さ・CRC-32 のみ。
+# 作業場のビルド内から、登録済み SHA256 に一致する code.bin を選ぶ。
+[[hooks]]
+name = "ChatInputHook"
+function = "ChatWindow_ConsumeInputResult"
+offset = 0
+length = 4
+
+[[checks]]
+name = "CurrentRoomCheck"
+function = "Room_GetCurrentId"
+offset = 0
+length = 4
