@@ -21,6 +21,8 @@ import tomllib
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
+import yaml
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import audit  # noqa: E402
 import capacity  # noqa: E402
@@ -654,11 +656,130 @@ def cmd_start(a) -> int:
         age = (datetime.datetime.now().astimezone() - datetime.datetime.fromisoformat(full_at)).days if full_at else None
         print("全関数の書き出し %s: %s%s" % (build, full_at or "未実施",
               " ← 作り直す（python scripts/orch.py export --build %s）" % build if age is None or age >= 7 else ""))
+    report_consolidation(c, DEFAULT_REPO, skip_missing=True)
     mirror(c)
     return 0
 
 
 # ---------- issue ----------
+def issue_body(scope: str, kind: str, difficulty: str, goal: str, target: str, materials: str) -> str:
+    return ("### スコープ\n\n%s\n\n### 種類\n\n%s\n\n### 難易度\n\n%s\n\n### 目的と完了条件\n\n%s\n\n"
+            "### 対象\n\n%s\n\n### 関係する資料\n\n%s\n") % (
+                scope, kind, difficulty, goal.strip(), target.strip(), materials.strip())
+
+
+def unconsolidated_counts(repo_dir: Path) -> dict[tuple[str, str], int]:
+    """kb.py と同じ記録配置を読み、未消化だけを数える。索引は更新前のことがあるため使わない。"""
+    base = repo_dir / "findings"
+    if not base.is_dir():
+        raise OrchError("findings/ が無い: %s" % repo_dir)
+    counts: dict[tuple[str, str], int] = {}
+    for scope_dir in sorted(base.iterdir()):
+        if not scope_dir.is_dir() or scope_dir.name not in SCOPES:
+            continue
+        for folder in sorted(scope_dir.iterdir()):
+            if not folder.is_dir() or not re.fullmatch(r"\d+-\d+", folder.name):
+                continue
+            for path in sorted(folder.glob("*.md")):
+                raw = path.read_text(encoding="utf-8")
+                match = re.match(r"\A---\n(.*?)\n---[ \t]*(?:\n|\Z)", raw, re.S)
+                if not match:
+                    raise OrchError("記録の frontmatter が無い: %s" % path)
+                try:
+                    meta = yaml.safe_load(match.group(1))
+                except yaml.YAMLError as e:
+                    raise OrchError("記録の frontmatter が読めない: %s: %s" % (path, e)) from e
+                if not isinstance(meta, dict):
+                    raise OrchError("記録の frontmatter が辞書ではない: %s" % path)
+                category = meta.get("category")
+                if (meta.get("state") != "active" or meta.get("consolidated_into")
+                        or not isinstance(category, str) or not category or category in ("_triage", "_product")):
+                    continue
+                key = (scope_dir.name, category)
+                counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def consolidation_threshold(c: Ctx, override: int | None) -> int:
+    value = override if override is not None else c.workers.get("limits", {}).get("consolidate_threshold", 10)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise OrchError("consolidate_threshold は 0 以上の整数にする")
+    return value
+
+
+def consolidation_candidates(c: Ctx, repo: str, threshold: int | None = None) -> list[tuple[str, str, int]]:
+    need_repo(c, repo)
+    limit = consolidation_threshold(c, threshold)
+    counts = unconsolidated_counts(c.root / repo)
+    return [(scope, category, count) for (scope, category), count in sorted(counts.items()) if count > limit]
+
+
+def consolidation_title(scope: str, category: str) -> str:
+    return "%s %s の記録を topics にまとめる" % (SCOPES[scope], category)
+
+
+def same_consolidation_issue(issue: dict, scope: str, category: str) -> bool:
+    if issue.get("title") == consolidation_title(scope, category):
+        return True
+    labels = {(lb.get("name") if isinstance(lb, dict) else lb) for lb in issue.get("labels", [])}
+    if "consolidate" not in labels:
+        return False
+    sections = parse_sections(issue.get("body", ""))
+    return (sections.get("スコープ") == scope
+            and sections.get("対象") == "findings/%s の %s カテゴリ" % (scope, category))
+
+
+def report_consolidation(c: Ctx, repo: str, threshold: int | None = None,
+                         create: bool = False, skip_missing: bool = False) -> list[tuple[str, str, int]]:
+    if skip_missing and (repo not in c.repos() or not (c.root / repo / "findings").is_dir()):
+        return []
+    candidates = consolidation_candidates(c, repo, threshold)
+    if not candidates:
+        if not skip_missing:
+            print("しきい値を超えたカテゴリ: なし")
+        return candidates
+    if skip_missing:
+        print("== 記録の消化 ==")
+    open_issues = []
+    if create:
+        raw = gh_run(["issue", "list", "--repo", repo_slug(c, repo), "--state", "open", "--limit", "1000",
+                      "--json", "number,title,body,labels"])
+        try:
+            open_issues = json.loads(raw)
+        except ValueError as e:
+            raise OrchError("open Issue の一覧が JSON でない: %s" % repo) from e
+    for scope, category, count in candidates:
+        title = consolidation_title(scope, category)
+        print("%s/%s: 未消化 %d 件（%s）" % (scope, category, count, title))
+        if not create:
+            continue
+        existing = next((it for it in open_issues if same_consolidation_issue(it, scope, category)), None)
+        if existing:
+            print("  既存の Issue #%s が開いているため作成しない" % existing.get("number", "?"))
+            continue
+        goal = ("%s/%s の未消化の記録を確認し、topics/%s/%s.md に現時点で分かっていることを統合する。\n"
+                "格付け A 以上のワーカーが担当し、「?」の旧記録は再解析と同時に扱う（旧記録への利用枠は3割まで）。\n"
+                "完了条件: 一次証拠と既存の topics を照合し、根拠となる記録を示して topics を更新する。"
+                "統合・重複する記録は報告で提案する。記録の state と consolidated_into は仕上げで確定する。") % (
+                    scope, category, scope, category)
+        body = issue_body(scope, "consolidate", "normal", goal, "findings/%s の %s カテゴリ" % (scope, category),
+                          "findings/%s/by-category/%s.md、topics/%s/%s.md、ac3ds-re の consolidate-category スキル" % (
+                              scope, category, scope, category))
+        outgoing(title, body)
+        args = ["issue", "create", "--repo", repo_slug(c, repo), "--title", title, "--body", body]
+        for label in (scope, "consolidate", "normal"):
+            args += ["--label", label]
+        number = pr_number(gh_run(args))
+        print("  Issue を作成: #%s" % number)
+        open_issues.append({"number": number, "title": title, "labels": [{"name": "consolidate"}]})
+    return candidates
+
+
+def cmd_consolidate_check(a) -> int:
+    report_consolidation(Ctx(), a.repo, a.threshold, a.create)
+    return 0
+
+
 def cmd_issue(a) -> int:
     c = Ctx()
     need_repo(c, a.repo)
@@ -669,9 +790,7 @@ def cmd_issue(a) -> int:
     pre = SCOPES[a.scope]
     if not title.startswith(pre):
         title = "%s %s" % (pre, title)
-    body = ("### スコープ\n\n%s\n\n### 種類\n\n%s\n\n### 難易度\n\n%s\n\n### 目的と完了条件\n\n%s\n\n"
-            "### 対象\n\n%s\n\n### 関係する資料\n\n%s\n") % (a.scope, a.kind, a.difficulty, a.goal.strip(),
-                                                          a.target.strip(), a.materials.strip())
+    body = issue_body(a.scope, a.kind, a.difficulty, a.goal, a.target, a.materials)
     outgoing(title, body)
     args = ["issue", "create", "--repo", repo_slug(c, a.repo), "--title", title, "--body", body]
     for lb in (a.scope, a.kind, a.difficulty):
@@ -1457,6 +1576,11 @@ def cmd_accept(a) -> int:
         refresh_export_after_accept(c, key, short)
     print("%s: 取り込み完了（%s、正本の取り込み: %s）" % (key, short, imp))
     cleanup_task(c, key, t, a.keep)
+    if a.repo == DEFAULT_REPO:
+        try:
+            report_consolidation(c, a.repo, skip_missing=True)
+        except (OrchError, OSError) as e:
+            print("警告: 消化の確認に失敗: %s" % e)
     return 1 if imp == "取り込み失敗" else 0
 
 
@@ -1586,6 +1710,9 @@ def main(argv=None) -> int:
     s.add_argument("--difficulty", required=True, choices=DIFFS)
     for k in ("title", "goal", "target", "materials"):
         s.add_argument("--" + k, required=True)
+    s = add("consolidate-check", cmd_consolidate_check)
+    s.add_argument("--create", action="store_true")
+    s.add_argument("--threshold", type=int)
     s = add("dispatch", cmd_dispatch)
     s.add_argument("issue", type=int)
     s.add_argument("--worker", required=True)
