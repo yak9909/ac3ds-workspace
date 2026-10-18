@@ -30,4 +30,5 @@ description: オーケストラがワーカーの結果を判定するときの�
 
 - 多くの関数から使われる名前・型、HIGH への昇格、上位の格付けの記録の訂正、消化（topics の更新）、ゲーム API ヘッダーに入る物。
 - `.claude/agents/reviewer` を起動する（effort は難易度 hard なら high、それ以外は medium）。依頼文には、記録・作業ツリー・IDB コピーの場所を書く。
+- 依頼文には次も書く: 関数は全関数の書き出し（`_local/builds/<ビルド>/export/`）で読む。関数の境界・型など重要な点は、Ghidra の独立の出力（ac3ds-re の `python tools/sync/ghidra/run.py dump --build <ビルド> --target <番地> --create`）でも確かめる（IDA の解析と独立に確かめるため）。
 - 利用枠が足りなければ gpt-6.1-sol に代えて、「Opus 未確認」の Issue を残す。
