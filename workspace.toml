@@ -8,11 +8,11 @@ remote = "https://github.com/yak9909/ac3ds-re.git"
 hooks = ".githooks"
 
 # 派生リポジトリ（任意）。作ったら追記する。
-# [repos.gohan]
-# role = "derived"
-# required = false
-# remote = "https://github.com/yak9909/gohan.git"
-# hooks = "../scripts/hooks/derived"
+[repos.gohan]
+role = "derived"
+required = false
+remote = "https://github.com/yak9909/gohan.git"
+hooks = "../scripts/hooks/derived"
 
 [local_only]
 # 作業場の直下に置いてよい、Git に入れないファイル
