@@ -1,0 +1,12 @@
+# 派生リポジトリの直下に game_api.toml として置く。
+# output は派生リポジトリからの相対パス。
+build = "acnl_jpn_v15"
+output = "include/game_api.h"
+
+functions = [
+  "ChatWindow_ConsumeInputResult",
+  "Room_GetCurrentId",
+  "Town_OnDayChange",
+]
+globals = ["g_RoomFlagTable"]
+types = ["ItemID"]

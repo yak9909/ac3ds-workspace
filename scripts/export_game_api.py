@@ -1,0 +1,203 @@
+"""選択したゲームのシンボルを C++17 のヘッダーに書き出す。"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import re
+import sys
+import tomllib
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent.parent
+IDENT = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*$")
+WORDS = re.compile(r"\b[A-Za-z_][A-Za-z_0-9]*\b")
+TYPE_MARKER = re.compile(r"^// type: ([A-Za-z_][A-Za-z_0-9]*)\s*$", re.M)
+FORBIDDEN = re.compile(r"\b(?:ACNL|HHD)-[A-Z]\d+\b|ac3ds-re|symbols[/\\]", re.I)
+
+
+def require_names(value: object, label: str) -> list[str]:
+    if not isinstance(value, list) or any(not isinstance(x, str) or not IDENT.fullmatch(x) for x in value):
+        raise ValueError(f"{label} は名前の配列にしてください")
+    if len(value) != len(set(value)):
+        raise ValueError(f"{label} に重複があります")
+    return value
+
+
+def read_config(repo: Path) -> tuple[str, Path, dict[str, list[str]]]:
+    config = tomllib.loads((repo / "game_api.toml").read_text(encoding="utf-8"))
+    if set(config) != {"build", "output", "functions", "globals", "types"}:
+        raise ValueError("game_api.toml の項目は build, output, functions, globals, types にしてください")
+    build, output = config["build"], config["output"]
+    if not isinstance(build, str) or not IDENT.fullmatch(build):
+        raise ValueError("build が不正です")
+    if not isinstance(output, str) or not output or Path(output).is_absolute():
+        raise ValueError("output はリポジトリ内の相対パスにしてください")
+    destination = (repo / output).resolve()
+    if not destination.is_relative_to(repo.resolve()):
+        raise ValueError("output はリポジトリ内にしてください")
+    names = {key: require_names(config[key], key) for key in ("functions", "globals", "types")}
+    return build, destination, names
+
+
+def read_symbols(folder: Path) -> dict[str, dict[str, str]]:
+    found: dict[str, dict[str, str]] = {}
+    for csv_path in sorted(folder.glob("*.csv")):
+        with csv_path.open(encoding="utf-8-sig", newline="") as stream:
+            for row in csv.DictReader(stream):
+                name = row["name"]
+                if not name:
+                    continue
+                if name in found:
+                    raise ValueError(f"重複した名前: {name}")
+                found[name] = row
+    return found
+
+
+def strip_comments(code: str) -> str:
+    code = re.sub(r"/\*.*?\*/", "", code, flags=re.S)
+    return re.sub(r"//[^\n]*", "", code)
+
+
+def cpp_syntax(code: str) -> str:
+    code = strip_comments(code)
+    for ida_type, cpp_type in (("__int8", "std::int8_t"), ("__int16", "std::int16_t"),
+                               ("__int32", "std::int32_t"), ("__int64", "std::int64_t")):
+        code = re.sub(r"\bunsigned\s+" + ida_type + r"\b", cpp_type.replace("int", "uint", 1), code)
+        code = re.sub(r"\b" + ida_type + r"\b", cpp_type, code)
+    code = re.sub(r"\b__(?:fastcall|cdecl|stdcall|thiscall|bitmask)\b", "", code)
+    code = re.sub(r"\b(?:uint8_t|uint16_t|uint32_t|uint64_t|int8_t|int16_t|int32_t|int64_t)\b",
+                  lambda m: "std::" + m.group() if code[max(0, m.start()-5):m.start()] != "std::" else m.group(), code)
+    return code
+
+
+def read_types(folder: Path) -> tuple[dict[str, str], dict[str, str]]:
+    definitions: dict[str, str] = {}
+    kinds: dict[str, str] = {}
+    for header in sorted(folder.glob("*.h")):
+        source = header.read_text(encoding="utf-8-sig")
+        matches = list(TYPE_MARKER.finditer(source))
+        for index, match in enumerate(matches):
+            name = match.group(1)
+            if name in definitions:
+                raise ValueError(f"重複した型: {name}")
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(source)
+            body = cpp_syntax(source[match.end():end]).strip()
+            if not body:
+                raise ValueError(f"空の型: {name}")
+            definitions[name] = body
+            kind = re.search(r"\b(struct|class|union|enum)\s+" + re.escape(name) + r"\b", body)
+            if kind:
+                kinds[name] = kind.group(1)
+    return definitions, kinds
+
+
+def dependencies(code: str, names: set[str], self_name: str) -> set[str]:
+    return (set(WORDS.findall(code)) & names) - {self_name}
+
+
+def selected_types(definitions: dict[str, str], kinds: dict[str, str], requested: list[str],
+                   references: list[str]) -> list[str]:
+    all_names = set(definitions)
+    missing = set(requested) - all_names
+    if missing:
+        raise ValueError("見つからない型: " + ", ".join(sorted(missing)))
+    needed = set(requested)
+    for reference in references:
+        needed.update(set(WORDS.findall(reference)) & all_names)
+    pending = list(needed)
+    while pending:
+        current = pending.pop()
+        for dependency in dependencies(definitions[current], all_names, current) - needed:
+            needed.add(dependency)
+            pending.append(dependency)
+    # ポインタによる循環参照には前方宣言を用い、定義は元ファイルの依存順を保つ。
+    order = [name for name in definitions if name in needed]
+    return order
+
+
+def address(row: dict[str, str]) -> str:
+    value = int(row["address"], 0)
+    if value < 0:
+        raise ValueError("負の番地です")
+    return f"0x{value:08X}"
+
+
+def function_lines(name: str, row: dict[str, str]) -> list[str]:
+    prototype = row["prototype"].strip()
+    addr = address(row)
+    if not prototype:
+        print(f"警告: {name} にプロトタイプがありません", file=sys.stderr)
+        return ["// プロトタイプ未設定",
+                f"inline constexpr std::uintptr_t {name}_addr = {addr};"]
+    prototype = cpp_syntax(prototype).strip()
+    match = re.fullmatch(r"(.+?)\s*\((.*)\)", prototype, re.S)
+    if not match:
+        raise ValueError(f"解釈できないプロトタイプ: {name}")
+    result, arguments = match.groups()
+    return [f"using {name}_t = {result.strip()} (*)({arguments.strip()});",
+            f"inline constexpr std::uintptr_t {name}_addr = {addr};"]
+
+
+def generate(repo: Path) -> Path:
+    build, destination, wanted = read_config(repo)
+    builds = tomllib.loads((ROOT / "ac3ds-re/meta/builds.toml").read_text(encoding="utf-8"))["builds"]
+    if build not in builds or "code_sha256" not in builds[build]:
+        raise ValueError(f"不明なビルド: {build}")
+    symbols = ROOT / "ac3ds-re/symbols" / build
+    if not symbols.is_dir():
+        raise ValueError(f"symbols がないビルド: {build}")
+    functions = read_symbols(symbols / "functions")
+    globals_ = read_symbols(symbols / "globals")
+    definitions, kinds = read_types(symbols / "types")
+    for label, names, available in (("関数", wanted["functions"], functions),
+                                    ("大域変数", wanted["globals"], globals_)):
+        missing = set(names) - set(available)
+        if missing:
+            raise ValueError(f"見つからない{label}: " + ", ".join(sorted(missing)))
+    references = [functions[name]["prototype"] for name in wanted["functions"]]
+    references += [globals_[name]["type"] for name in wanted["globals"]]
+    order = selected_types(definitions, kinds, wanted["types"], references)
+    lines = ["// 生成物。編集しない（export_game_api.py が作り直す）。",
+             f"// build: {build}", f"// code SHA256: {builds[build]['code_sha256']}",
+             "#pragma once", "#include <cstdint>", ""]
+    declarations = [f"{kinds[name]} {name};" for name in order if kinds.get(name) in ("struct", "class", "union")]
+    if declarations:
+        lines.extend(declarations + [""])
+    for name in order:
+        if name in ("uint8_t", "uint16_t", "uint32_t", "uint64_t", "int8_t", "int16_t", "int32_t", "int64_t"):
+            continue  # <cstdint> の型を重ねて定義しない
+        lines.extend([definitions[name], ""])
+    for name in wanted["functions"]:
+        lines.extend(function_lines(name, functions[name]) + [""])
+    for name in wanted["globals"]:
+        raw_type = globals_[name]["type"].strip()
+        if not raw_type:
+            raise ValueError(f"大域変数 {name} に型がありません")
+        typ = cpp_syntax(raw_type).strip()
+        lines.append(f"using {name}_t = {typ};")
+        lines.append(f"inline constexpr std::uintptr_t {name}_addr = {address(globals_[name])};")
+        lines.append("")
+    result = "\n".join(lines).rstrip() + "\n"
+    if FORBIDDEN.search(result):
+        raise ValueError("生成したヘッダーに解析固有の情報が含まれています")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(result, encoding="utf-8")
+    return destination
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", required=True, type=Path, help="game_api.toml を置いた派生リポジトリ")
+    args = parser.parse_args()
+    try:
+        print(generate(args.repo.resolve()))
+    except (OSError, KeyError, ValueError, tomllib.TOMLDecodeError) as exc:
+        print(f"エラー: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
