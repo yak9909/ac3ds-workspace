@@ -16,4 +16,4 @@ hooks = ".githooks"
 
 [local_only]
 # 作業場の直下に置いてよい、Git に入れないファイル
-files = ["STRUCTURE_DRAFT.md", "workspace.local.toml"]
+files = ["STRUCTURE_DRAFT.md", "GOHAN_DRAFT.md", "workspace.local.toml"]
