@@ -1,5 +1,6 @@
 import datetime as dt
 import json
+import os
 from types import SimpleNamespace
 
 import capacity
@@ -50,8 +51,33 @@ def test_hourly_rate_and_log_limit(tmp_path):
                      "dispatched_at": NOW.isoformat(), "accepted_at": (NOW + dt.timedelta(hours=2)).isoformat()}}
     assert capacity.hourly_rates(tasks, {"sonnet": 10})["sonnet"] == 5
     log = tmp_path / "codex_one.jsonl"
-    log.write_text(json.dumps({"error": "usage limit resets at 2026-10-18T03:00:00Z"}), encoding="utf-8")
+    log.write_text(json.dumps({"type": "error", "message": "usage limit resets at 2026-10-18T03:00:00Z"}),
+                   encoding="utf-8")
     assert capacity.codex_limit_until(tmp_path, NOW) == NOW + dt.timedelta(hours=3)
+
+
+def test_log_output_does_not_signal_limit(tmp_path):
+    log = tmp_path / "codex_one.jsonl"
+    log.write_text(json.dumps({"type": "item.completed", "item": {"type": "command_execution",
+                       "aggregated_output": "usage limit resets at 2026-10-18T03:00:00Z"}}), encoding="utf-8")
+    assert capacity.codex_limit_until(tmp_path, NOW) is None
+
+
+def test_error_limit_ends_at_english_reset(tmp_path):
+    log = tmp_path / "codex_one.jsonl"
+    log.write_text(json.dumps({"type": "turn.failed", "error": {
+        "message": "usage limit reached; try again at Oct 16th, 2026 2:02 AM"}}), encoding="utf-8")
+    reset = dt.datetime(2026, 10, 16, 2, 2).astimezone(dt.timezone.utc)
+    assert capacity.codex_limit_until(tmp_path, reset - dt.timedelta(seconds=1)) == reset
+    assert capacity.codex_limit_until(tmp_path, reset) is None
+
+
+def test_error_without_reset_expires_after_five_hours(tmp_path):
+    log = tmp_path / "codex_one.jsonl"
+    log.write_text(json.dumps({"type": "error", "message": "usage limit reached"}), encoding="utf-8")
+    os.utime(log, (NOW.timestamp(), NOW.timestamp()))
+    assert capacity.codex_limit_until(tmp_path, NOW + dt.timedelta(hours=4)) == NOW + dt.timedelta(hours=5)
+    assert capacity.codex_limit_until(tmp_path, NOW + dt.timedelta(hours=5)) is None
 
 
 def test_stats_rows():

@@ -14,6 +14,13 @@ EXCLUDED_LABELS = {"report", "blocked", "needs-user"}
 ADDRESS = re.compile(r"(?<![\w])0x[0-9a-fA-F]+\b")
 LIMIT_ERROR = re.compile(r"usage limit|rate limit|利用上限|使用上限", re.I)
 RESET = re.compile(r"(?:resets?\s*(?:at|in)?|reset_at|リセット(?:時刻)?)[^\d]{0,25}(\d{4}-\d\d-\d\d[T ]\d\d:\d\d(?::\d\d)?(?:Z|[+-]\d\d:?\d\d)?)", re.I)
+ENGLISH_RESET = re.compile(
+    r"\b(?:try again at|resets? at)\s+"
+    r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|"
+    r"Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+"
+    r"(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\s+(\d{1,2}):(\d{2})\s*(AM|PM)\b", re.I)
+MONTHS = {name: month for month, name in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
 
 
 def instant(value):
@@ -92,11 +99,32 @@ def codex_limit_until(log_dir, now):
     if not log_dir.is_dir():
         return None
     for path in sorted(log_dir.glob("codex_*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]:
+        fallback = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc) + dt.timedelta(hours=5)
         for line in reversed(path.read_text(encoding="utf-8", errors="replace").splitlines()[-200:]):
-            if LIMIT_ERROR.search(line) and (m := RESET.search(line)):
-                reset = instant(m.group(1))
-                if reset and now < reset:
-                    return reset
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict) or event.get("type") not in ("error", "turn.failed"):
+                continue
+            message = event.get("message")
+            if message is None and isinstance(event.get("error"), dict):
+                message = event["error"].get("message")
+            if not isinstance(message, str) or not LIMIT_ERROR.search(message):
+                continue
+            iso = RESET.search(message)
+            reset = instant(iso.group(1)) if iso else None
+            if reset is None and (english := ENGLISH_RESET.search(message)):
+                month, day, year, hour, minute, meridiem = english.groups()
+                try:
+                    local = dt.datetime(int(year), MONTHS[month[:3].lower()], int(day),
+                                        int(hour) % 12 + (12 if meridiem.upper() == "PM" else 0), int(minute))
+                    reset = local.astimezone(dt.timezone.utc)
+                except ValueError:
+                    pass
+            until = reset or fallback
+            if now < until:
+                return until
     return None
 
 
