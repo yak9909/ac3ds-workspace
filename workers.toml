@@ -33,6 +33,13 @@ default_effort = "xhigh"
 roles = ["simple", "tooling", "analysis-light"]
 note = "2026-10-15〜。易しい作業全般と易しめの normal を最初に担当。駄目なら sonnet-5.5"
 
+[workers."opus-5.5"]
+provider = "claude"
+agent = "tooling"
+default_effort = "high"
+roles = ["design"]
+note = "2026-10-19〜。利用者の指定で、gohan の UI のデザインを担当。利用枠を多く使うので、他の作業には使わない"
+
 [workers."gpt-6.1-sol"]
 provider = "codex"
 default_effort = "medium"
