@@ -844,7 +844,68 @@ def dispatch_export_line(c: Ctx, build: str) -> str:
     return line
 
 
+# 事前確認の結果に、Issue の本文と事前確認の中の番地を kb.py addr で自動で引いて付ける。引くのは 0x00100000 以上だけ
+AUTO_ADDR_MIN = 0x00100000
+AUTO_ADDR_MAX = 30
+ADDR_RE = re.compile(r"(?<![0-9A-Za-z_])0x([0-9A-Fa-f]+)(?![0-9A-Za-z_])")
+
+
+def read_precheck(path: str) -> str:
+    try:
+        text = Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        text = ""
+    except UnicodeDecodeError as e:
+        raise OrchError("事前確認の結果が UTF-8 で読めない: %s" % path) from e
+    if not text:
+        raise OrchError("事前確認の結果が空（ファイルが無い、または空白だけ: %s）。"
+                        "kb.py search と addr で引いた語・番地と結果を書く" % path)
+    return text
+
+
+def auto_addresses(*texts: str) -> list[int]:
+    """与えた順に 0x... の番地を集める。同じ値は1つにし、AUTO_ADDR_MIN 未満は除く。"""
+    found: list[int] = []
+    for text in texts:
+        for m in ADDR_RE.finditer(text or ""):
+            v = int(m.group(1), 16)
+            if v >= AUTO_ADDR_MIN and v not in found:
+                found.append(v)
+    return found
+
+
+def lookup_addr(c: Ctx, value: int) -> str:
+    """ac3ds-re の kb.py addr で番地を引く。引けなくても例外にせず、「引けなかった（理由）」の文字列を返す。"""
+    repo_dir = c.root / DEFAULT_REPO
+    if not repo_dir.is_dir():
+        return "引けなかった（%s が無い）" % DEFAULT_REPO
+    kb = repo_dir / "tools" / "kb.py"
+    if not kb.is_file():
+        return "引けなかった（kb.py が無い）"
+    try:
+        code, out = run_py(c, repo_dir, kb, ["addr", "0x%08X" % value, "--ref-limit", "3"])
+    except OSError as e:
+        return "引けなかった（kb.py を起動できない: %s）" % e
+    if code != 0:
+        return "引けなかった（kb.py が終了コード %d: %s）" % (code, out.splitlines()[-1] if out else "出力なし")
+    return out or "引けなかった（kb.py の出力が空）"
+
+
+def auto_addr_section(c: Ctx, *texts: str) -> str:
+    found = auto_addresses(*texts)
+    if not found:
+        return ""
+    lines = ["自動で引いた番地（kb.py addr --ref-limit 3）:"]
+    for v in found[:AUTO_ADDR_MAX]:
+        lines.append("- 0x%08X" % v)
+        lines += ["  " + x for x in lookup_addr(c, v).splitlines()]
+    if len(found) > AUTO_ADDR_MAX:
+        lines.append("- ほか %d 件は引かない（上限 %d 件）" % (len(found) - AUTO_ADDR_MAX, AUTO_ADDR_MAX))
+    return "\n".join(lines)
+
+
 def cmd_dispatch(a) -> int:
+    precheck = read_precheck(a.precheck)  # 空なら、Git にも GitHub にも触る前に止める
     c = Ctx()
     usage_watch.collect(c.root)
     role = need_repo(c, a.repo).get("role", "analysis")
@@ -921,11 +982,12 @@ def cmd_dispatch(a) -> int:
         except OrchError:
             pass  # 3ds など、ビルドの無いスコープには書き出しが無い
     tools = "、".join(x for x in (a.tools, export_line) if x)
+    auto = auto_addr_section(c, issue.get("body") or "", precheck)
     text = tpl.read_text(encoding="utf-8").format(
         repo=a.repo, goal=goal, worktree=str(wt),
         idb_line=("、IDB の作業用コピー %s" % idb["path"]) if idb else "",
         materials=sec.get("関係する資料", "").strip() or "なし",
-        precheck=Path(a.precheck).read_text(encoding="utf-8").strip() if a.precheck else "なし",
+        precheck=precheck + ("\n\n" + auto if auto else ""),
         tools_line=("- 道具: %s" % tools) if tools else "")
     out = task_file(c, "dispatch", a.repo, a.issue)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1747,7 +1809,7 @@ def main(argv=None) -> int:
     s.add_argument("--worker", required=True)
     s.add_argument("--effort")
     s.add_argument("--idb", action="store_true")
-    s.add_argument("--precheck")
+    s.add_argument("--precheck", required=True)
     s.add_argument("--tools")
     s.add_argument("--ignore-limit", action="store_true")
     s = add("save", cmd_save)

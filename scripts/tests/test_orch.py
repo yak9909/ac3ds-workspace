@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +17,7 @@ from conftest import FAKE_EMAIL, REAL_ROOT
 GIT = wslib.git_exe(REAL_ROOT)
 ISSUE_BODY = ("### スコープ\n\nacnl\n\n### 種類\n\nanalysis\n\n### 難易度\n\nnormal\n\n"
               "### 目的と完了条件\n\nある関数を調べる\n\n### 対象\n\n0x00100000\n\n### 関係する資料\n\nなし\n")
+PRECHECK = "kb.py search「ある関数」: 該当なし\n"
 
 
 def g(cwd, *args):
@@ -134,6 +136,10 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(orch, "gh_run", fake)
     monkeypatch.setattr(orch, "CHECK_POLL_SEC", 0)
     monkeypatch.setattr(orch, "CHECK_APPEAR_SEC", 1)
+    # 実際の利用枠（~/.codex の記録など）を読むと、試験の結果が使用率で変わるので差し替える
+    monkeypatch.setattr(orch.usage_watch, "collect", lambda *_, **__: {})
+    monkeypatch.setattr(orch, "capacity_reports", lambda *_: {p: {"recommended": 10} for p in ("claude", "codex")})
+    (ws / "_local" / "precheck.md").write_text(PRECHECK, encoding="utf-8")
     # 偽の正本 IDB
     ida = ws / "_local" / "builds" / "acnl_jpn_v15" / "ida"
     ida.mkdir(parents=True)
@@ -149,8 +155,13 @@ def tasks(ws):
     return json.loads((ws / "_local" / "state" / "tasks.json").read_text(encoding="utf-8"))["tasks"]
 
 
+def precheck_args(ws):
+    return ["--precheck", str(ws / "_local" / "precheck.md")]
+
+
 def dispatch(env, idb=True):
-    a = ["dispatch", "5", "--worker", "sonnet-5.5"]
+    ws = env[0]
+    a = ["dispatch", "5", "--worker", "sonnet-5.5", *precheck_args(ws)]
     return run(*(a + (["--idb"] if idb else [])))
 
 
@@ -213,10 +224,81 @@ def test_dispatch(env):
     idb = Path(t["idb"]["path"])
     assert idb.read_bytes() == b"fake" and "work" in idb.parts
     text = (ws / "_local" / "orchestrator" / "dispatch" / "5.md").read_text(encoding="utf-8")
-    assert "ある関数を調べる" in text and str(idb) in text and "事前に引いた既存の知見: なし" in text
+    assert "ある関数を調べる" in text and str(idb) in text and "事前に引いた既存の知見: kb.py search" in text
     # 再試行は作業ツリーを再利用して試行回数が増える
     assert dispatch(env) == 0
     assert tasks(ws)["ac3ds-re#5"]["attempts"] == 2
+
+
+def test_dispatch_requires_precheck_option(env, capsys):
+    ws, fake, _ = env
+    with pytest.raises(SystemExit):
+        run("dispatch", "5", "--worker", "sonnet-5.5")
+    assert "--precheck" in capsys.readouterr().err
+    assert not fake.calls and not (ws / "_local" / "state" / "tasks.json").exists()
+
+
+@pytest.mark.parametrize("content", [None, "", " \n\t\n"])
+def test_dispatch_refuses_empty_precheck_before_any_work(env, capsys, content):
+    ws, fake, _ = env
+    path = ws / "_local" / "empty.md"
+    if content is not None:
+        path.write_text(content, encoding="utf-8")
+    assert run("dispatch", "5", "--worker", "sonnet-5.5", "--precheck", str(path)) == 1
+    assert "事前確認の結果が空" in capsys.readouterr().err
+    assert not fake.calls and not (ws / "_local" / "state" / "tasks.json").exists()
+    assert not (ws / "_local" / "orchestrator" / "dispatch" / "5.md").exists()
+
+
+def test_dispatch_auto_addresses_go_into_precheck(env, monkeypatch):
+    ws, _, _ = env
+    asked = []
+
+    def fake_lookup(c, value):
+        asked.append(value)
+        return "KB結果 0x%08X" % value
+
+    monkeypatch.setattr(orch, "lookup_addr", fake_lookup)
+    path = ws / "_local" / "addr.md"
+    # 本文の 0x00100000 と同じ値は重複させない。0x00200000 は新しい値。0x000FFFFF と 0x100 は引かない
+    path.write_text("手掛かり 0x00200000 と 0x00100000、対象外 0x000FFFFF と 0x100\n", encoding="utf-8")
+    assert run("dispatch", "5", "--worker", "sonnet-5.5", "--precheck", str(path)) == 0
+    assert asked == [0x00100000, 0x00200000]
+    text = (ws / "_local" / "orchestrator" / "dispatch" / "5.md").read_text(encoding="utf-8")
+    assert "手掛かり 0x00200000" in text and "自動で引いた番地" in text
+    assert "- 0x00100000\n  KB結果 0x00100000" in text and "- 0x00200000\n  KB結果 0x00200000" in text
+
+
+def test_auto_addresses_rules():
+    texts = ("0x00100000 と 0x00100000、0x000FFFFF、0x100", "番地0x00200000。a0x00300000 と 0x0030000g", None)
+    assert orch.auto_addresses(*texts) == [0x00100000, 0x00200000]
+    assert orch.auto_addresses("0x00FFFFFF 0x00100000 0x01000000") == [0x00FFFFFF, 0x00100000, 0x01000000]
+
+
+def test_auto_addresses_capped_at_30(env, monkeypatch):
+    ws, _, _ = env
+    calls = []
+    monkeypatch.setattr(orch, "lookup_addr", lambda c, v: calls.append(v) or "KB")
+    path = ws / "_local" / "many.md"
+    path.write_text("".join("0x%08X\n" % (0x00100000 + i) for i in range(32)), encoding="utf-8")
+    assert run("dispatch", "5", "--worker", "sonnet-5.5", "--precheck", str(path)) == 0
+    assert len(calls) == orch.AUTO_ADDR_MAX == 30
+    text = (ws / "_local" / "orchestrator" / "dispatch" / "5.md").read_text(encoding="utf-8")
+    assert "ほか 2 件は引かない" in text
+
+
+def test_dispatch_continues_when_kb_fails(env):
+    ws, _, _ = env
+    (ws / "ac3ds-re" / "tools" / "kb.py").write_text(
+        "import sys\nprint('試験の失敗', file=sys.stderr)\nsys.exit(3)\n", encoding="utf-8")
+    assert dispatch(env) == 0
+    text = (ws / "_local" / "orchestrator" / "dispatch" / "5.md").read_text(encoding="utf-8")
+    assert "引けなかった（kb.py が終了コード 3: 試験の失敗）" in text
+
+
+def test_lookup_addr_without_ac3ds_re(tmp_path):
+    c = SimpleNamespace(root=tmp_path, data=tmp_path, state=tmp_path, git=GIT)
+    assert orch.lookup_addr(c, 0x00100000) == "引けなかった（ac3ds-re が無い）"
 
 
 @pytest.mark.parametrize("kind", ["pr", "closed"])
@@ -420,7 +502,7 @@ def test_paused_task_not_counted_for_dispatch(env, monkeypatch):
 
     monkeypatch.setattr(orch, "git", stop_before_git)
     with pytest.raises(ReachedWorktree):
-        run("dispatch", "6", "--worker", "sonnet-5.5")
+        run("dispatch", "6", "--worker", "sonnet-5.5", *precheck_args(ws))
     assert tasks(ws)["ac3ds-re#5"]["state"] == "paused"
 
 
@@ -627,7 +709,7 @@ def codex_jsonl(*msgs):
 
 def test_codex_runs_and_saves_log_and_report(env, capsys, monkeypatch):
     ws, fake, _ = env
-    assert run("dispatch", "5", "--worker", "gpt-6-sol") == 0
+    assert run("dispatch", "5", "--worker", "gpt-6-sol", *precheck_args(ws)) == 0
     t = tasks(ws)["ac3ds-re#5"]
     wt = Path(t["worktree"])
     assert t["provider"] == "codex" and t["worker"] == "gpt-6-sol"
@@ -657,7 +739,7 @@ def test_codex_runs_and_saves_log_and_report(env, capsys, monkeypatch):
 
 def test_codex_keeps_existing_report_and_numbers_logs(env, monkeypatch):
     ws, fake, _ = env
-    run("dispatch", "5", "--worker", "gpt-6-sol")
+    run("dispatch", "5", "--worker", "gpt-6-sol", *precheck_args(ws))
     wt = Path(tasks(ws)["ac3ds-re#5"]["worktree"])
     (wt / ".task" / "report.md").write_text("手で書いた報告\n", encoding="utf-8")
     use_codex(monkeypatch, codex_jsonl("別の返答"))
@@ -669,7 +751,7 @@ def test_codex_keeps_existing_report_and_numbers_logs(env, monkeypatch):
 
 def test_codex_failure_returns_1(env, monkeypatch, capsys):
     ws, fake, _ = env
-    run("dispatch", "5", "--worker", "gpt-6-sol")
+    run("dispatch", "5", "--worker", "gpt-6-sol", *precheck_args(ws))
     wt = Path(tasks(ws)["ac3ds-re#5"]["worktree"])
     use_codex(monkeypatch, "", err="ERROR 起動に失敗\n", code=1)
     assert run("codex", "5") == 1
@@ -692,7 +774,7 @@ def test_codex_refused_for_claude_worker_or_inactive_task(env, monkeypatch):
 
 def test_codex_dry_run_prints_only(env, monkeypatch, capsys):
     ws, fake, _ = env
-    run("dispatch", "5", "--worker", "gpt-6-sol")
+    run("dispatch", "5", "--worker", "gpt-6-sol", *precheck_args(ws))
     before = tasks(ws)["ac3ds-re#5"]
     fc = use_codex(monkeypatch, codex_jsonl("x"))
     assert run("codex", "5", "--dry-run", "--model", "gpt-6-luna", "--effort", "xhigh") == 0
@@ -707,7 +789,7 @@ def test_codex_dry_run_prints_only(env, monkeypatch, capsys):
 @pytest.mark.parametrize("with_idb", [True, False])
 def test_codex_dry_run_sandbox_mode(env, monkeypatch, capsys, with_idb):
     ws, _, _ = env
-    args = ["dispatch", "5", "--worker", "gpt-6-sol"]
+    args = ["dispatch", "5", "--worker", "gpt-6-sol", *precheck_args(ws)]
     assert run(*(args + (["--idb"] if with_idb else []))) == 0
     monkeypatch.setattr(orch, "find_codex", lambda: "codex")
     assert run("codex", "5", "--dry-run") == 0
@@ -812,7 +894,7 @@ def test_codex_resume_refuses_missing_log(codex_unit, monkeypatch, tmp_path, cap
 
 def test_codex_idb_records_git_commit_violation(env, monkeypatch, capsys):
     ws, _, _ = env
-    assert run("dispatch", "5", "--worker", "gpt-6-sol", "--idb") == 0
+    assert run("dispatch", "5", "--worker", "gpt-6-sol", "--idb", *precheck_args(ws)) == 0
     wt = Path(tasks(ws)["ac3ds-re#5"]["worktree"])
     monkeypatch.setattr(orch, "find_codex", lambda: "codex")
 

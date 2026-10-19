@@ -103,7 +103,9 @@ def test_dispatch_rejects_capacity_before_work(monkeypatch, tmp_path):
     monkeypatch.setattr(orch, "read_issue", lambda *_: {"state": "OPEN", "body": "0x100", "title": "x"})
     monkeypatch.setattr(orch, "load_tasks", lambda *_: {})
     monkeypatch.setattr(orch, "capacity_reports", lambda *_: {"codex": {"recommended": 0}})
-    a = SimpleNamespace(repo="ac3ds-re", issue=5, worker="gpt", ignore_limit=False)
+    precheck = tmp_path / "precheck.md"
+    precheck.write_text("kb.py search: 該当なし\n", encoding="utf-8")
+    a = SimpleNamespace(repo="ac3ds-re", issue=5, worker="gpt", ignore_limit=False, precheck=str(precheck))
     try:
         orch.cmd_dispatch(a)
     except orch.OrchError as e:
