@@ -18,6 +18,7 @@ GIT = wslib.git_exe(REAL_ROOT)
 ISSUE_BODY = ("### スコープ\n\nacnl\n\n### 種類\n\nanalysis\n\n### 難易度\n\nnormal\n\n"
               "### 目的と完了条件\n\nある関数を調べる\n\n### 対象\n\n0x00100000\n\n### 関係する資料\n\nなし\n")
 PRECHECK = "kb.py search「ある関数」: 該当なし\n"
+SCORES = "根拠と結論の一致=0.9,根拠の独立性=0.9,既存の知見との整合=0.9,確度の妥当性=0.9,名前・型の妥当性=0.9"
 
 
 def g(cwd, *args):
@@ -420,11 +421,11 @@ def test_stamp_outside_change_can_be_allowed(env, capsys):
 
 def test_accept_order_errors(env):
     ws, fake, origin, wt = ready(env)
-    assert run("accept", "5", "--scores", "a=5") == 1  # stamp 前
+    assert run("accept", "5", "--scores", SCORES) == 1  # stamp 前
     run("stamp", "5")
     (wt / "docs").mkdir(exist_ok=True)
     (wt / "docs" / "late.md").write_text("late\n", encoding="utf-8")
-    assert run("accept", "5", "--scores", "a=5") == 1  # stamp 後の変更
+    assert run("accept", "5", "--scores", SCORES) == 1  # stamp 後の変更
     assert not fake.named("pr", "merge")
 
 
@@ -432,7 +433,7 @@ def test_accept_dry_run_writes_nothing(env, capsys):
     ws, fake, origin, wt = ready(env)
     run("stamp", "5")
     before = (tasks(ws), g(wt, "rev-parse", "HEAD"), len(fake.calls))
-    assert run("accept", "5", "--scores", "a=5", "--dry-run") == 0
+    assert run("accept", "5", "--scores", SCORES, "--dry-run") == 0
     assert (tasks(ws), g(wt, "rev-parse", "HEAD"), len(fake.calls)) == before
     assert (wt / ".task").exists()
     assert run("reject", "5", "--reason", "x", "--dry-run") == 0
@@ -442,7 +443,7 @@ def test_accept_dry_run_writes_nothing(env, capsys):
 def test_accept_full(env):
     ws, fake, origin, wt = ready(env)
     run("stamp", "5")
-    assert run("accept", "5", "--scores", "正確さ=5,根拠=4") == 0
+    assert run("accept", "5", "--scores", SCORES) == 0
     t = tasks(ws)["ac3ds-re#5"]
     assert t["state"] == "accepted" and t["idb_import"] == "未実装"
     assert not (wt / ".task").exists()
@@ -469,7 +470,7 @@ def test_pause_unpause_and_refused_commands(env, capsys):
     out = capsys.readouterr().out
     assert "== 保留中のタスク ==" in out and "ac3ds-re#5" in out
     assert "== 動いているタスク ==\nなし" in out
-    for args in (("save", "5"), ("stamp", "5"), ("accept", "5", "--scores", "a=5"),
+    for args in (("save", "5"), ("stamp", "5"), ("accept", "5", "--scores", SCORES),
                  ("codex", "5")):
         assert run(*args) == 1
         assert "先に unpause" in capsys.readouterr().err
@@ -522,7 +523,7 @@ def test_accept_syncs_skills_after_merge(env, monkeypatch, changed):
     monkeypatch.setattr(orch.sync_skills, "check", lambda root: ["workspace skills mismatch"])
     calls = []
     monkeypatch.setattr(orch.sync_skills, "sync", lambda root: calls.append(root) or [])
-    assert run("accept", "5", "--scores", "a=5") == 0
+    assert run("accept", "5", "--scores", SCORES) == 0
     assert calls == [ws]
 
 
@@ -571,7 +572,7 @@ def test_accept_waits_for_checks_of_pushed_commit(env, capsys):
     ws, fake, origin, wt = ready(env)
     run("stamp", "5")
     fake.checks_script = [None, None, [{"name": "audit", "bucket": "pending"}], [{"name": "audit", "bucket": "pass"}]]
-    assert run("accept", "5", "--scores", "a=5") == 0, capsys.readouterr().err
+    assert run("accept", "5", "--scores", SCORES) == 0, capsys.readouterr().err
     assert len(fake.named("pr", "checks")) == 4
     assert fake.named("pr", "merge")
 
@@ -580,7 +581,7 @@ def test_accept_waits_until_pr_head_is_pushed_commit(env):
     ws, fake, origin, wt = ready(env)
     run("stamp", "5")
     fake.view_lag = 2
-    assert run("accept", "5", "--scores", "a=5") == 0
+    assert run("accept", "5", "--scores", SCORES) == 0
     assert len(fake.named("pr", "view")) >= 3
 
 
@@ -589,7 +590,7 @@ def test_accept_stops_when_required_check_never_appears(env, capsys, monkeypatch
     run("stamp", "5")
     monkeypatch.setattr(orch, "CHECK_APPEAR_SEC", 0)
     fake.checks_script = [None]
-    assert run("accept", "5", "--scores", "a=5") == 1
+    assert run("accept", "5", "--scores", SCORES) == 1
     assert "必須: audit" in capsys.readouterr().err
     assert not fake.named("pr", "merge")
     assert tasks(ws)["ac3ds-re#5"]["state"] == "stamped"
@@ -601,7 +602,7 @@ def test_accept_without_required_checks_warns(env, capsys, monkeypatch):
     monkeypatch.setattr(orch, "CHECK_APPEAR_SEC", 0)
     fake.protection = None
     fake.checks_script = [None]
-    assert run("accept", "5", "--scores", "a=5") == 0
+    assert run("accept", "5", "--scores", SCORES) == 0
     assert "警告: チェックが1つも無い" in capsys.readouterr().out
     assert fake.named("pr", "merge")
 
@@ -610,9 +611,9 @@ def test_accept_resumes_after_its_own_prep_commit(env):
     ws, fake, origin, wt = ready(env)
     run("stamp", "5")
     fake.fail["pr ready"] = 1
-    assert run("accept", "5", "--scores", "a=5") == 1  # 準備のコミットを作った後で失敗
+    assert run("accept", "5", "--scores", SCORES) == 1  # 準備のコミットを作った後で失敗
     assert tasks(ws)["ac3ds-re#5"]["state"] == "stamped"
-    assert run("accept", "5", "--scores", "a=5") == 0
+    assert run("accept", "5", "--scores", SCORES) == 0
     assert tasks(ws)["ac3ds-re#5"]["state"] == "accepted"
 
 
@@ -620,10 +621,10 @@ def test_accept_refuses_change_after_prep_commit(env):
     ws, fake, origin, wt = ready(env)
     run("stamp", "5")
     fake.fail["pr ready"] = 1
-    assert run("accept", "5", "--scores", "a=5") == 1
+    assert run("accept", "5", "--scores", SCORES) == 1
     (wt / "docs").mkdir(exist_ok=True)
     (wt / "docs" / "x.md").write_text("x\n", encoding="utf-8")
-    assert run("accept", "5", "--scores", "a=5") == 1
+    assert run("accept", "5", "--scores", SCORES) == 1
     assert not fake.named("pr", "merge")
 
 
@@ -912,3 +913,180 @@ def test_codex_idb_records_git_commit_violation(env, monkeypatch, capsys):
     assert "警告: ワーカーが Git に書き込んだ" in output
     assert "HEAD:" in violation and "HEAD:" in output
     assert g(wt, "rev-parse", "HEAD").strip() in violation
+
+
+# ---------- 採点の項目と合格の基準（accept）----------
+ITEMS = orch.EVAL_ITEMS["analysis"]
+DERIVED_SCORES = "完了条件の達成=0.9,設計書との整合=0.9,既存の知見との整合=0.9,試験の妥当性=0.9,決まりの順守=0.9"
+
+
+def test_eval_items_are_the_two_rubrics():
+    assert ITEMS == ("根拠と結論の一致", "根拠の独立性", "既存の知見との整合", "確度の妥当性", "名前・型の妥当性")
+    assert orch.EVAL_ITEMS["derived"] == ("完了条件の達成", "設計書との整合", "既存の知見との整合", "試験の妥当性", "決まりの順守")
+
+
+@pytest.mark.parametrize("role,items", [("analysis", ITEMS), ("derived", orch.EVAL_ITEMS["derived"])])
+def test_check_scores_accepts_items_of_the_role(role, items):
+    orch.check_scores({k: 0.9 for k in items}, role, 0.6)
+    orch.check_scores({k: 0.6 for k in items}, role, 0.6)  # 基準ちょうどは合格
+
+
+@pytest.mark.parametrize("scores,role,msg", [
+    ({k: 0.9 for k in ITEMS[:4]}, "analysis", "不足"),                              # 項目が足りない
+    ({**{k: 0.9 for k in ITEMS}, "正確さ": 0.9}, "analysis", "余分"),               # 余分な項目
+    ({k: 0.9 for k in orch.EVAL_ITEMS["derived"]}, "analysis", "不足"),           # 派生の項目を解析に付けた
+    ({**{k: 0.9 for k in ITEMS}, ITEMS[0]: 1.5}, "analysis", "0〜1"),
+    ({**{k: 0.9 for k in ITEMS}, ITEMS[0]: -0.1}, "analysis", "0〜1"),
+    ({**{k: 0.9 for k in ITEMS}, ITEMS[0]: float("nan")}, "analysis", "0〜1"),
+    ({**{k: 0.9 for k in ITEMS}, ITEMS[0]: 0.5}, "analysis", "合格の基準"),
+    ({k: 0.9 for k in ITEMS}, "tooling", "採点表が無い役"),
+])
+def test_check_scores_refuses(scores, role, msg):
+    with pytest.raises(orch.OrchError, match=msg):
+        orch.check_scores(scores, role, 0.6)
+
+
+def test_parse_scores_rejects_duplicate_names():
+    with pytest.raises(orch.OrchError, match="重複"):
+        orch.parse_scores("a=0.9,a=0.8")
+
+
+def test_pass_min_comes_from_workers_toml():
+    assert orch.pass_min(SimpleNamespace(workers={"evaluation": {"pass_min": 0.6}})) == 0.6
+    with pytest.raises(orch.OrchError, match="pass_min"):
+        orch.pass_min(SimpleNamespace(workers={}))
+
+
+def test_accept_refuses_wrong_score_names(env, capsys):
+    ws, fake, origin, wt = ready(env)
+    run("stamp", "5")
+    assert run("accept", "5", "--scores", "a=0.9") == 1
+    assert "採点の項目が違う" in capsys.readouterr().err
+    assert not fake.named("pr", "merge")
+
+
+# ---------- 派生の Issue に解析の情報を書かない（issue）----------
+def add_derived_repo(ws, api_text=None):
+    with (ws / "workspace.toml").open("a", encoding="utf-8") as f:
+        f.write('\n[repos.gohan]\nrole = "derived"\nremote = "https://github.com/yak9909/gohan.git"\n')
+    (ws / "gohan").mkdir()
+    if api_text is not None:
+        (ws / "gohan" / "spec").mkdir()
+        (ws / "gohan" / "spec" / "game_api.toml").write_text(api_text, encoding="utf-8")
+
+
+@pytest.mark.parametrize("goal", ["ACNL-F0123 を参照", "hhd-f0001 の続き", "ac3ds-re の記録を見る"])
+def test_derived_issue_refuses_analysis_ids_and_names(env, capsys, goal):
+    ws, fake, _ = env
+    add_derived_repo(ws)
+    n = len(fake.calls)
+    assert run("issue", "--repo", "gohan", "--scope", "acnl", "--kind", "analysis", "--difficulty", "easy",
+               "--title", "x", "--goal", goal, "--target", "t", "--materials", "m") == 1
+    assert "解析の情報" in capsys.readouterr().err
+    assert len(fake.calls) == n
+
+
+def test_derived_issue_without_analysis_info_is_created(env):
+    ws, fake, _ = env
+    add_derived_repo(ws)
+    assert run("issue", "--repo", "gohan", "--scope", "hhd", "--kind", "analysis", "--difficulty", "easy",
+               "--title", "調べる", "--goal", "g", "--target", "t", "--materials", "なし") == 0
+    args, _ = fake.named("issue", "create")[0]
+    assert args[args.index("--repo") + 1] == "yak9909/gohan"
+
+
+# ---------- 深い検証の要否（stamp・accept）----------
+def base_symbols(ws):
+    """main に symbols の基準を入れる（作業の差分で名前・型の変更を作るため）。"""
+    re_ = ws / "ac3ds-re"
+    fun = re_ / "symbols" / "acnl_jpn_v15" / "functions"
+    typ = re_ / "symbols" / "acnl_jpn_v15" / "types"
+    fun.mkdir(parents=True)
+    typ.mkdir(parents=True)
+    (fun / "00100000.csv").write_text(
+        "address,size,name,prototype,confidence,source,refs,clone_of\n"
+        "0x00100000,4,sub_100000,,,analysis,,\n0x00100010,8,keep_fn,,,analysis,,\n",
+        encoding="utf-8", newline="\n")
+    (typ / "local_types.h").write_text("struct ACNL_Foo {\n    int a;\n};\n", encoding="utf-8", newline="\n")
+    g(re_, "add", "-A")
+    g(re_, "commit", "-m", "基準の symbols")
+    g(re_, "push", "origin", "main")
+
+
+def symbol_change(env, api_text):
+    """sub_100000 を renamed_fn に改名し、ACNL_Foo の宣言行を変えて save する。派生の spec には api_text を書く。"""
+    ws, fake, origin = env
+    base_symbols(ws)
+    dispatch(env)
+    wt = Path(tasks(ws)["ac3ds-re#5"]["worktree"])
+    fun = wt / "symbols" / "acnl_jpn_v15" / "functions" / "00100000.csv"
+    fun.write_text(fun.read_text(encoding="utf-8").replace("sub_100000", "renamed_fn"), encoding="utf-8", newline="\n")
+    typ = wt / "symbols" / "acnl_jpn_v15" / "types" / "local_types.h"
+    typ.write_text(typ.read_text(encoding="utf-8").replace("struct ACNL_Foo {", "struct ACNL_Foo { // 変更"),
+                   encoding="utf-8", newline="\n")
+    add_derived_repo(ws, api_text)
+    assert run("save", "5") == 0
+    return ws, fake, wt
+
+
+@pytest.mark.parametrize("api,expected", [
+    ('functions = ["renamed_fn"]\ntypes = ["ACNL_Foo"]\n', ["ACNL_Foo", "renamed_fn"]),
+    ('functions = ["sub_100000"]\n', ["sub_100000"]),  # 旧名を使っていれば、改名で壊れるので対象
+    ('functions = ["keep_fn"]\n', None),                 # 変わっていない名前だけなら対象ではない
+])
+def test_stamp_flags_deep_review_for_names_in_derived_api(env, capsys, api, expected):
+    ws, fake, wt = symbol_change(env, api)
+    assert run("stamp", "5") == 0
+    out = capsys.readouterr().out
+    t = tasks(ws)["ac3ds-re#5"]
+    if expected:
+        assert "深い検証の対象: %s（gohan の spec/game_api.toml）" % ", ".join(expected) in out
+        assert t["deep_review_required"] is True and t["deep_review_names"] == expected
+    else:
+        assert "深い検証の対象" not in out and "## 深い検証の要否" in out
+        assert t["deep_review_required"] is False
+
+
+def test_accept_needs_reviewed_when_deep_review_required(env, capsys):
+    ws, fake, wt = symbol_change(env, 'functions = ["renamed_fn"]\n')
+    run("stamp", "5")
+    assert run("accept", "5", "--scores", SCORES) == 1
+    assert "--reviewed" in capsys.readouterr().err
+    assert not fake.named("pr", "merge")
+    review = ws / "_local" / "review.md"
+    review.write_text("深い検証: renamed_fn を IDB で確かめた（試験）\n", encoding="utf-8")
+    assert run("accept", "5", "--scores", SCORES, "--reviewed", str(review)) == 0
+    bodies = [args[args.index("--body") + 1] for args, _ in fake.named("pr", "comment")]
+    assert any(b.startswith("深い検証の報告:") and "renamed_fn を IDB" in b for b in bodies)
+    assert tasks(ws)["ac3ds-re#5"]["state"] == "accepted"
+
+
+# ---------- 推奨並列数を超える依頼（dispatch・--ignore-limit）----------
+def test_ignore_limit_needs_a_reason(env, monkeypatch, capsys):
+    ws, fake, _ = env
+    monkeypatch.setattr(orch, "capacity_reports", lambda *_: {"claude": {"recommended": 0}})
+    assert run("dispatch", "5", "--worker", "sonnet-5.5", *precheck_args(ws)) == 1
+    assert run("dispatch", "5", "--worker", "sonnet-5.5", *precheck_args(ws), "--ignore-limit", "") == 1
+    assert "理由を書く" in capsys.readouterr().err
+    assert not (ws / "_local" / "state" / "tasks.json").exists()
+
+
+def test_ignore_limit_reason_is_recorded(env, monkeypatch):
+    ws, fake, _ = env
+    monkeypatch.setattr(orch, "capacity_reports", lambda *_: {"claude": {"recommended": 0}})
+    assert run("dispatch", "5", "--worker", "sonnet-5.5", *precheck_args(ws), "--ignore-limit", "試験の理由") == 0
+    t = tasks(ws)["ac3ds-re#5"]
+    assert t["ignore_limit_reason"] == "試験の理由"
+    assert t["ignored_limits"] == ["推奨並列数 0（稼働中 0）"]
+
+
+@pytest.mark.parametrize("state,refused", [("saved", False), ("stamped", False), ("dispatched", True)])
+def test_parallel_limit_counts_only_running_tasks(env, monkeypatch, capsys, state, refused):
+    ws, fake, _ = env
+    orch.update_task(orch.Ctx(), "ac3ds-re#4", repo="ac3ds-re", issue=4, provider="claude",
+                     worker="sonnet-5.5", state=state)
+    monkeypatch.setattr(orch, "capacity_reports", lambda *_: {"claude": {"recommended": 1}})
+    code = run("dispatch", "5", "--worker", "sonnet-5.5", *precheck_args(ws))
+    assert code == (1 if refused else 0)
+    if refused:
+        assert "推奨並列数 1 を超える（稼働中 1" in capsys.readouterr().err

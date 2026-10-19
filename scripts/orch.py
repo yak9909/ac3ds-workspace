@@ -12,6 +12,7 @@ import glob
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -27,6 +28,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import audit  # noqa: E402
 import capacity  # noqa: E402
+import export_game_api  # noqa: E402
 import usage_watch  # noqa: E402
 import sync_skills  # noqa: E402
 import wslib  # noqa: E402
@@ -39,7 +41,16 @@ except ImportError:  # 依存が無い環境でも読み込めるように
 SCOPES = {"acnl": "[ACNL]", "hhd": "[HHD]", "3ds": "[3DS]"}
 KINDS = ["analysis", "import", "triage", "consolidate", "reanalyze", "review", "tooling", "report"]
 DIFFS = ["easy", "normal", "hard"]
+# 作業の途中の状態（ACTIVE）。dispatched は、ワーカーが作業中（動いている）。
+# saved は保存済み、stamped は stamp 済みで、どちらもワーカーは止まって評価を待つ。
 ACTIVE = ("dispatched", "saved", "stamped")
+RUNNING = ("dispatched",)  # 並列数で数える「動いている」state
+# 採点表の項目（workers.toml の [evaluation].pass_min で判定する）。役ごとに、この順で並ぶ。
+EVAL_ITEMS = {
+    "analysis": ("根拠と結論の一致", "根拠の独立性", "既存の知見との整合", "確度の妥当性", "名前・型の妥当性"),
+    "derived": ("完了条件の達成", "設計書との整合", "既存の知見との整合", "試験の妥当性", "決まりの順守"),
+}
+DEEP_REVIEW_SPEC = "spec/game_api.toml"  # 派生リポジトリの直下にある、ゲーム API の定義
 DEFAULT_REPO = "ac3ds-re"
 CHECK_POLL_SEC = 15
 CHECK_APPEAR_SEC = 90  # push したコミットに検査が現れるまで待つ上限
@@ -787,9 +798,19 @@ def cmd_consolidate_check(a) -> int:
     return 0
 
 
+def analysis_leaks(c: Ctx, text: str) -> list[str]:
+    """派生リポジトリに書いてはいけない解析の情報（記録 ID・解析リポジトリの名前とパス）。export_game_api の FORBIDDEN と同じ考え。"""
+    found = {m.group(0) for m in export_game_api.FORBIDDEN.finditer(text)}
+    path = str(c.root / DEFAULT_REPO)
+    for p in (path, path.replace("\\", "/")):
+        if p in text:
+            found.add(p)
+    return sorted(found)
+
+
 def cmd_issue(a) -> int:
     c = Ctx()
-    need_repo(c, a.repo)
+    role = need_repo(c, a.repo).get("role", "analysis")
     for k in ("title", "goal", "target", "materials"):
         if not (getattr(a, k) or "").strip():
             raise OrchError("必須項目が空: --%s" % k)
@@ -798,6 +819,10 @@ def cmd_issue(a) -> int:
     if not title.startswith(pre):
         title = "%s %s" % (pre, title)
     body = issue_body(a.scope, a.kind, a.difficulty, a.goal, a.target, a.materials)
+    if role == "derived":
+        leaks = analysis_leaks(c, title + "\n" + body)
+        if leaks:
+            raise OrchError("派生リポジトリの Issue に解析の情報を書かない: %s" % ", ".join(leaks))
     outgoing(title, body)
     args = ["issue", "create", "--repo", repo_slug(c, a.repo), "--title", title, "--body", body]
     for lb in (a.scope, a.kind, a.difficulty):
@@ -904,8 +929,18 @@ def auto_addr_section(c: Ctx, *texts: str) -> str:
     return "\n".join(lines)
 
 
+def ignore_reason(a) -> str:
+    """--ignore-limit <理由> の理由。付けなければ ""。理由が空の指定は拒否する。"""
+    raw = getattr(a, "ignore_limit", None)
+    if isinstance(raw, str) and not raw.strip():
+        raise OrchError("--ignore-limit には理由を書く（台帳に残す）")
+    return raw.strip() if isinstance(raw, str) else ""
+
+
 def cmd_dispatch(a) -> int:
     precheck = read_precheck(a.precheck)  # 空なら、Git にも GitHub にも触る前に止める
+    ignore = ignore_reason(a)
+    ignored: list[str] = []  # 理由を付けて無視した制限（台帳に残す）
     c = Ctx()
     usage_watch.collect(c.root)
     role = need_repo(c, a.repo).get("role", "analysis")
@@ -915,8 +950,10 @@ def cmd_dispatch(a) -> int:
     w = wks[a.worker]
     lim = c.workers.get("limits", {}).get("stop_at_used_percent", 80)
     usage = capacity.read_provider_usage(c.state, w.get("provider")).get("five_hour_used_percent")
-    if usage is not None and usage >= lim and not a.ignore_limit:
-        raise OrchError("5時間枠の使用率 %s%% が上限 %s%% 以上なので依頼しない（--ignore-limit で無視）" % (usage, lim))
+    if usage is not None and usage >= lim:
+        if not ignore:
+            raise OrchError("5時間枠の使用率 %s%% が上限 %s%% 以上なので依頼しない（--ignore-limit <理由> で無視）" % (usage, lim))
+        ignored.append("5時間枠 %s%%（上限 %s%%）" % (usage, lim))
     raw = gh_run(["api", "repos/%s/issues/%s" % (repo_slug(c, a.repo), a.issue)])
     try:
         issue_api = json.loads(raw)
@@ -935,16 +972,20 @@ def cmd_dispatch(a) -> int:
     old = load_tasks(c).get(key)
     if old:
         require_unpaused(old)
-    if not a.ignore_limit and not (old and old.get("state") in ACTIVE):
+    if not (old and old.get("state") in ACTIVE):
         provider = w.get("provider")
         current_issue = dict(issue, repo=a.repo, number=a.issue)
         report = capacity_reports(c, current_issue).get(provider)
         if report:
-            active_count = sum(t.get("provider") == provider and t.get("state") in ACTIVE
+            # 稼働中は動いている作業（RUNNING）だけ。保存済み・stamp 済みは、ワーカーが止まって評価を待っている
+            active_count = sum(t.get("provider") == provider and t.get("state") in RUNNING
                                for t in load_tasks(c).values())
             if active_count + 1 > report["recommended"]:
-                raise OrchError("%s の推奨並列数 %d を超える（稼働中 %d、--ignore-limit で無視）" % (
-                    provider, report["recommended"], active_count))
+                msg = "%s の推奨並列数 %d を超える（稼働中 %d、--ignore-limit <理由> で無視）" % (
+                    provider, report["recommended"], active_count)
+                if not ignore:
+                    raise OrchError(msg)
+                ignored.append("推奨並列数 %d（稼働中 %d）" % (report["recommended"], active_count))
     repo_dir = c.root / a.repo
     wt = c.data / "worktrees" / a.repo / str(a.issue)
     branch = old["branch"] if old else "task/%s-%s" % (a.issue, short_slug(issue.get("title", "")))
@@ -997,7 +1038,8 @@ def cmd_dispatch(a) -> int:
                 worker=a.worker, provider=w.get("provider"), effort=a.effort or w.get("default_effort"),
                 idb=idb, state="dispatched", attempts=(old.get("attempts", 0) + 1) if old else 1,
                 dispatched_at=now(), usage_before=usage, body=issue.get("body", ""),
-                stamped_head=None, outside_before=outside_before)
+                stamped_head=None, outside_before=outside_before, ignore_limit_reason=ignore or None,
+                ignored_limits=ignored)
     print(text)
     print("--- 依頼文を保存: %s（ブランチ %s、%s %s）" % (out, branch, a.worker, a.effort or w.get("default_effort")))
     return 0
@@ -1397,6 +1439,47 @@ def new_records(c: Ctx, wt: Path, base: str) -> list[str]:
     return out
 
 
+def symbol_rows(c: Ctx, wt: Path, rev: str, path: str) -> dict:
+    src = git(c, wt, "show", "%s:%s" % (rev, path), check=False)
+    return {row["address"]: row for row in csv.DictReader(io.StringIO(src)) if row.get("address")}
+
+
+def changed_symbol_names(c: Ctx, wt: Path, base: str) -> set[str]:
+    """深い検証の判断に使う、symbols の変更の名前。functions・globals は名前か型（prototype・type）が変わった行の
+    名前（旧名と新名）、types は変更行にある識別子（C の予約語を除く）。"""
+    names: set[str] = set()
+    for path in git(c, wt, "diff", "--name-only", base + "...HEAD", "--", "symbols").splitlines():
+        parts = path.split("/")
+        if len(parts) < 3:
+            continue
+        kind = parts[2].removesuffix(".csv")
+        if kind in ("functions", "globals") and path.endswith(".csv"):
+            old, new = symbol_rows(c, wt, base, path), symbol_rows(c, wt, "HEAD", path)
+            for addr, o in old.items():
+                n = new.get(addr)
+                if n and any(o.get(k) != n.get(k) for k in ("name", "prototype", "type")):
+                    names.update(x for x in (o.get("name"), n.get("name")) if x)
+        elif kind == "types":
+            for line in git(c, wt, "diff", "-U0", base + "...HEAD", "--", path).splitlines():
+                if line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
+                    names.update(re.findall(r"[A-Za-z_][A-Za-z_0-9]*", line[1:]))
+    return names - export_game_api.CPP_KEYWORDS
+
+
+def deep_review_hits(c: Ctx, names: set[str]) -> dict[str, list[str]]:
+    """作業場にある派生リポジトリの spec/game_api.toml に出てくる名前を、派生リポジトリごとに返す。"""
+    hits: dict[str, list[str]] = {}
+    for repo, r in c.repos().items():
+        spec = c.root / repo / DEEP_REVIEW_SPEC
+        if r.get("role") != "derived" or not spec.is_file():
+            continue
+        words = set(export_game_api.WORDS.findall(spec.read_text(encoding="utf-8", errors="replace")))
+        found = sorted(names & words)
+        if found:
+            hits[repo] = found
+    return hits
+
+
 def cmd_stamp(a) -> int:
     c = Ctx()
     role = need_repo(c, a.repo).get("role", "analysis")
@@ -1424,11 +1507,15 @@ def cmd_stamp(a) -> int:
         update_task(c, key, attempts=n + 1)  # save と同じく、コミットのたびに番号を進める
     git(c, wt, "push", "-u", "origin", t["branch"])
     sym, builds = symbols_diff(c, wt, base)
+    deep = deep_review_hits(c, changed_symbol_names(c, wt, base))
+    deep_names = sorted({n for ns in deep.values() for n in ns})
+    deep_lines = ["深い検証の対象: %s（%s）" % (", ".join(deep_names), "、".join(
+        "%s の %s" % (r, DEEP_REVIEW_SPEC) for r in deep))] if deep else ["なし"]
     ok = all(code == 0 for _, code, _ in checks)
     recs = new_records(c, wt, base)
     lines = ["# 採点用の要約: %s" % key, "", "## 変更したファイル", git(c, wt, "diff", "--stat", base + "...HEAD").rstrip() or "なし",
              git(c, wt, "status", "--short").rstrip(), "", "## 新しい記録"] + (recs or ["なし"]) + \
-            ["", "## symbols の差分"] + (sym or ["なし"]) + ["", "## 検査の結果"]
+            ["", "## symbols の差分"] + (sym or ["なし"]) + ["", "## 深い検証の要否"] + deep_lines + ["", "## 検査の結果"]
     for n, code, out in checks:
         lines.append("- %s: %s" % (n, "OK" if code == 0 else "失敗(%d)" % code))
         if out:
@@ -1439,7 +1526,7 @@ def cmd_stamp(a) -> int:
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text(text, encoding="utf-8", newline="\n")
     update_task(c, key, state="stamped", stamped_at=now(), stamped_head=head(c, wt), stamp_ok=ok,
-                symbols_builds=builds, prep_head=None)
+                symbols_builds=builds, prep_head=None, deep_review_required=bool(deep), deep_review_names=deep_names)
     print(text)
     print("--- 保存: %s%s" % (f, "" if ok else "（検査に失敗あり。accept は拒否される）"))
     return 0
@@ -1452,15 +1539,42 @@ def parse_scores(s: str) -> dict:
         if not part.strip():
             continue
         k, sep, v = part.partition("=")
+        if not sep or not k.strip():
+            raise OrchError("点数の形式が違う: %r（項目=点,...）" % part)
+        if k.strip() in out:
+            raise OrchError("点数の項目が重複: %s" % k.strip())
         try:
             out[k.strip()] = float(v)
         except ValueError:
             raise OrchError("点数の形式が違う: %r（項目=点,...）" % part)
-        if not sep or not k.strip():
-            raise OrchError("点数の形式が違う: %r" % part)
     if not out:
         raise OrchError("--scores が空")
     return out
+
+
+def pass_min(c: Ctx) -> float:
+    v = c.workers.get("evaluation", {}).get("pass_min")
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        raise OrchError("workers.toml に [evaluation].pass_min が無い")
+    return float(v)
+
+
+def check_scores(scores: dict, role: str, minimum: float) -> None:
+    """採点の項目が役の採点表と一致し、各点が 0〜1 で、どれも合格の基準以上であることを確かめる。"""
+    items = EVAL_ITEMS.get(role)
+    if items is None:
+        raise OrchError("採点表が無い役: %s" % role)
+    missing = [i for i in items if i not in scores]
+    extra = [k for k in scores if k not in items]
+    if missing or extra:
+        raise OrchError("採点の項目が違う（不足: %s、余分: %s）。項目は %s" % (
+            ", ".join(missing) or "なし", ", ".join(extra) or "なし", ", ".join(items)))
+    for k in items:
+        v = scores[k]
+        if math.isnan(v) or not 0 <= v <= 1:
+            raise OrchError("点数は 0〜1 にする: %s=%g" % (k, v))
+        if v < minimum:
+            raise OrchError("%s=%g が合格の基準 %g に届かない（どの項目も基準以上で合格）" % (k, v, minimum))
 
 
 def required_checks(c: Ctx, slug: str) -> list[str]:
@@ -1601,11 +1715,12 @@ def refresh_export_after_accept(c: Ctx, key: str, commit: str) -> None:
 
 def cmd_accept(a) -> int:
     c = Ctx()
-    need_repo(c, a.repo)
+    role = need_repo(c, a.repo).get("role", "analysis")
     t = get_task(c, a.repo, a.issue)
     require_unpaused(t)
     key = tkey(a.repo, a.issue)
     scores = parse_scores(a.scores)
+    check_scores(scores, role, pass_min(c))
     wt = Path(t["worktree"])
     if t.get("state") != "stamped":
         raise OrchError("状態が %s。先に stamp が要る" % t.get("state"))
@@ -1614,19 +1729,29 @@ def cmd_accept(a) -> int:
     # stamp の後の変更は、accept 自身が作った準備のコミットだけ許す（途中で失敗した accept のやり直し）
     if git(c, wt, "status", "--porcelain").strip() or head(c, wt) not in (t.get("stamped_head"), t.get("prep_head")):
         raise OrchError("stamp の後に変更がある。もう一度 stamp する")
+    if t.get("deep_review_required") and not a.reviewed:
+        raise OrchError("深い検証の対象がある（%s）。深い検証の報告を --reviewed <ファイル> で渡す" % (
+            ", ".join(t.get("deep_review_names") or [])))
+    reviewed = read_source(a.reviewed).strip() if a.reviewed else ""
+    if a.reviewed and not reviewed:
+        raise OrchError("深い検証の報告が空: %s" % a.reviewed)
     slug = repo_slug(c, a.repo)
     comment = "合格\n\n採点: " + ", ".join("%s=%g" % kv for kv in scores.items())
+    review_comment = "深い検証の報告:\n\n" + reviewed if reviewed else ""
     if a.dry_run:
         print("dry-run: 次を行う（何も書かない）")
-        for s in ("origin/main を取り込み（merge）", "索引を作り直し、.task/ を消してコミット・push",
-                  "PR #%s にコメント「%s」" % (t["pr"], comment.replace("\n", " ")), "PR を ready に",
+        steps = ["origin/main を取り込み（merge）", "索引を作り直し、.task/ を消してコミット・push"]
+        if reviewed:
+            steps.append("PR #%s に深い検証の報告をコメント" % t["pr"])
+        steps += ["PR #%s にコメント「%s」" % (t["pr"], comment.replace("\n", " ")), "PR を ready に",
                   "検査が揃うのを待ち、完了を待つ（最大 %d 秒・%d 分）" % (CHECK_APPEAR_SEC, CHECK_TIMEOUT_SEC // 60),
                   "gh pr merge --merge",
                   "手元の main を更新", "symbols 変更(%s)があれば正本の IDB へ取り込み" % (t.get("symbols_builds") or "なし"),
-                  "台帳を accepted に"):
+                  "台帳を accepted に"]
+        for s in steps:
             print("  - " + s)
         return 0
-    outgoing(comment)
+    outgoing(comment, *([review_comment] if reviewed else []))
     git(c, wt, "fetch", "origin")
     mr = subprocess.run([c.git, "merge", "origin/main", "-m", "main を取り込み"], cwd=str(wt), capture_output=True,
                         text=True, env=tool_env(c))
@@ -1645,6 +1770,8 @@ def cmd_accept(a) -> int:
             raise OrchError("取り込み前の lint が失敗:\n" + out[-400:])
     git(c, wt, "push", "origin", t["branch"])
     sha = head(c, wt)
+    if reviewed:
+        gh_run(["pr", "comment", str(t["pr"]), "--repo", slug, "--body", review_comment])
     gh_run(["pr", "comment", str(t["pr"]), "--repo", slug, "--body", comment])
     gh_run(["pr", "ready", str(t["pr"]), "--repo", slug])
     wait_checks(c, slug, t["pr"], sha)
@@ -1811,7 +1938,7 @@ def main(argv=None) -> int:
     s.add_argument("--idb", action="store_true")
     s.add_argument("--precheck", required=True)
     s.add_argument("--tools")
-    s.add_argument("--ignore-limit", action="store_true")
+    s.add_argument("--ignore-limit", metavar="理由", help="推奨並列数・5時間枠の制限を、理由を付けて無視する（台帳に残す）")
     s = add("save", cmd_save)
     s.add_argument("issue", type=int)
     s.add_argument("--message")
@@ -1835,6 +1962,7 @@ def main(argv=None) -> int:
     s = add("accept", cmd_accept, dry=True)
     s.add_argument("issue", type=int)
     s.add_argument("--scores", required=True)
+    s.add_argument("--reviewed", help="深い検証の報告のファイル（- は標準入力）。PR のコメントに残す")
     s.add_argument("--keep", action="store_true")
     s = add("reject", cmd_reject, dry=True)
     s.add_argument("issue", type=int)
