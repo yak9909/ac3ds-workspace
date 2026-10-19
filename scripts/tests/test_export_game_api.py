@@ -204,6 +204,31 @@ class ExportGameApiTests(unittest.TestCase):
         self.assertIn("Entry_addr = 0x00100000", content)
         self.assertIn("仮想番地 0x00100000", "".join(call.args[0] for call in stderr.write.call_args_list))
 
+    def test_ida_integer_spellings_become_cstdint_names(self):
+        for bits in ("8", "16", "32", "64"):
+            with self.subTest(bits=bits):
+                self.assertEqual(api.cpp_syntax(f"signed __int{bits} a"), f"std::int{bits}_t a")
+                self.assertEqual(api.cpp_syntax(f"unsigned __int{bits} a"), f"std::uint{bits}_t a")
+                self.assertEqual(api.cpp_syntax(f"__int{bits} a"), f"std::int{bits}_t a")
+        self.assertEqual(api.cpp_syntax("int __fastcall(signed __int8 a, unsigned __int64 *b)"),
+                         "int (std::int8_t a, std::uint64_t *b)")
+        self.assertEqual(api.cpp_syntax("signed char c; my__int8 d;"), "signed char c; my__int8 d;")
+
+    def test_ida_integers_in_types_and_prototypes_are_cpp(self):
+        (self.symbols / "types/ints.h").write_text(
+            "// type: Ints\nstruct Ints { signed __int8 a; unsigned __int8 b; __int16 c; "
+            "signed __int32 d; unsigned __int64 e; };\n", encoding="utf-8")
+        path = self.symbols / "functions/00100000.csv"
+        path.write_text(path.read_text(encoding="utf-8").replace(
+            "int __fastcall(Node *node)", '"int __fastcall(signed __int8 a, unsigned __int64 *b)"'), encoding="utf-8")
+        self.config(types='["Node", "Ints"]')
+        content = api.generate(self.repo).read_text(encoding="utf-8")
+        self.assertIn("struct Ints { std::int8_t a; std::uint8_t b; std::int16_t c; "
+                      "std::int32_t d; std::uint64_t e; };", content)
+        self.assertIn("using ThumbFunc_t = int (*)(std::int8_t a, std::uint64_t *b);", content)
+        for leftover in ("signed std::", "unsigned std::", "__int"):
+            self.assertNotIn(leftover, content)
+
 
 if __name__ == "__main__":
     unittest.main()

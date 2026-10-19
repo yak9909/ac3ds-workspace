@@ -15,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*$")
 WORDS = re.compile(r"\b[A-Za-z_][A-Za-z_0-9]*\b")
+IDA_INTEGER = re.compile(r"\b(?:(signed|unsigned)\s+)?__int(8|16|32|64)\b")
 TYPE_MARKER = re.compile(r"^// type: ([A-Za-z_][A-Za-z_0-9]*)\s*$", re.M)
 FORBIDDEN = re.compile(r"\b(?:ACNL|HHD)-[A-Z]\d+\b|ac3ds-re|symbols[/\\]", re.I)
 CPP_KEYWORDS = set("""alignas alignof and and_eq asm auto bitand bitor bool break case catch
@@ -154,12 +155,15 @@ def strip_comments(code: str) -> str:
     return re.sub(r"//[^\n]*", "", code)
 
 
+def ida_integer(match: re.Match[str]) -> str:
+    # signed と前置きなしの __intN は符号付きの型、unsigned __intN は符号なしの型にする。
+    sign = "u" if match.group(1) == "unsigned" else ""
+    return f"std::{sign}int{match.group(2)}_t"
+
+
 def cpp_syntax(code: str) -> str:
     code = strip_comments(code)
-    for ida_type, cpp_type in (("__int8", "std::int8_t"), ("__int16", "std::int16_t"),
-                               ("__int32", "std::int32_t"), ("__int64", "std::int64_t")):
-        code = re.sub(r"\bunsigned\s+" + ida_type + r"\b", cpp_type.replace("int", "uint", 1), code)
-        code = re.sub(r"\b" + ida_type + r"\b", cpp_type, code)
+    code = IDA_INTEGER.sub(ida_integer, code)
     code = re.sub(r"\b__(?:fastcall|cdecl|stdcall|thiscall|bitmask)\b", "", code)
     code = re.sub(r"\b(?:uint8_t|uint16_t|uint32_t|uint64_t|int8_t|int16_t|int32_t|int64_t)\b",
                   lambda m: "std::" + m.group() if code[max(0, m.start()-5):m.start()] != "std::" else m.group(), code)
