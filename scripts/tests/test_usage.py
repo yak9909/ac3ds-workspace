@@ -91,7 +91,7 @@ def test_guard_threshold_once_and_message(tmp_path, monkeypatch, capsys, provide
     assert output["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
     assert expected in output["hookSpecificOutput"]["additionalContext"]
     assert "80%" in output["hookSpecificOutput"]["additionalContext"]
-    assert (tmp_path / "_local/state/guard" / (provider + "-session-1")).exists()
+    assert len(list((tmp_path / "_local/state/guard").glob(provider + "-v2-*.json"))) == 1
     payload["hook_event_name"] = "PostToolUse"
     assert usage_guard.guard(provider, payload, tmp_path) is None
     payload["session_id"] = "session-2"
@@ -113,6 +113,91 @@ def test_guard_failure_is_silent(monkeypatch, capsys):
     monkeypatch.setattr(usage_watch, "collect", fail)
     assert usage_guard.main(["--provider", "codex"]) == 0
     assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_guard_once_per_window(tmp_path, monkeypatch, provider):
+    monkeypatch.setenv("AC3DS_GUARD_THRESHOLD", "80")
+    clock = [100]
+    usage = {provider: {"five_hour_used_percent": 85, "resets_at": 200}}
+    monkeypatch.setattr(usage_guard.time, "time", lambda: clock[0])
+    monkeypatch.setattr(usage_watch, "collect", lambda *_: usage)
+    payload = {"session_id": "continued-session", "hook_event_name": "PreToolUse"}
+
+    assert usage_guard.guard(provider, payload, tmp_path) is not None
+    payload["hook_event_name"] = "PostToolUse"
+    usage[provider]["five_hour_used_percent"] = 99
+    usage[provider]["resets_at"] = "200.0"  # 数値の表現が変わっても同じ枠
+    assert usage_guard.guard(provider, payload, tmp_path) is None
+    clock[0] = 199
+    assert usage_guard.guard(provider, payload, tmp_path) is None
+
+    clock[0] = 200
+    usage[provider]["resets_at"] = 400
+    assert usage_guard.guard(provider, payload, tmp_path) is not None
+    assert usage_guard.guard(provider, payload, tmp_path) is None
+    markers = list((tmp_path / "_local/state/guard").glob("*.json"))
+    assert len(markers) == 1
+    assert json.loads(markers[0].read_text(encoding="utf-8"))["expires_at"] == 400
+
+
+@pytest.mark.parametrize("agents", [
+    [None, "worker-1", "worker-2"], ["worker-2", "worker-1", None]])
+def test_guard_each_agent_in_shared_session(tmp_path, monkeypatch, agents):
+    monkeypatch.setenv("AC3DS_GUARD_THRESHOLD", "80")
+    monkeypatch.setattr(usage_guard.time, "time", lambda: 100)
+    monkeypatch.setattr(usage_watch, "collect", lambda *_: {
+        "claude": {"five_hour_used_percent": 80, "resets_at": 200}})
+    for agent in agents:
+        payload = {"session_id": "shared", "agent_id": agent, "hook_event_name": "PreToolUse"}
+        output = usage_guard.guard("claude", payload, tmp_path)
+        message = output["hookSpecificOutput"]["additionalContext"]
+        assert (".task/notes.md" if agent else "スキル wrapup") in message
+        assert usage_guard.guard("claude", payload, tmp_path) is None
+    assert len(list((tmp_path / "_local/state/guard").glob("*.json"))) == len(agents)
+
+
+@pytest.mark.parametrize("reset", [None, "invalid"])
+def test_guard_without_reset_uses_time_window(tmp_path, monkeypatch, reset):
+    monkeypatch.setenv("AC3DS_GUARD_THRESHOLD", "80")
+    clock = [100]
+    monkeypatch.setattr(usage_guard.time, "time", lambda: clock[0])
+    monkeypatch.setattr(usage_watch, "collect", lambda *_: {
+        "claude": {"five_hour_used_percent": 85, "resets_at": reset}})
+    payload = {"session_id": "shared", "hook_event_name": "PreToolUse"}
+    assert usage_guard.guard("claude", payload, tmp_path) is not None
+    clock[0] = 5 * 60 * 60 - 1
+    assert usage_guard.guard("claude", payload, tmp_path) is None
+    clock[0] = 5 * 60 * 60
+    assert usage_guard.guard("claude", payload, tmp_path) is not None
+    assert usage_guard.guard("claude", payload, tmp_path) is None
+    assert len(list((tmp_path / "_local/state/guard").glob("*.json"))) == 1
+
+
+def test_guard_cleans_expired_markers_below_threshold(tmp_path, monkeypatch):
+    monkeypatch.setenv("AC3DS_GUARD_THRESHOLD", "80")
+    monkeypatch.setattr(usage_guard.time, "time", lambda: 200)
+    monkeypatch.setattr(usage_watch, "collect", lambda *_: {
+        "claude": {"five_hour_used_percent": 0, "resets_at": 400}})
+    directory = tmp_path / "_local/state/guard"
+    expired = directory / "claude-v2-expired.json"
+    current = directory / "claude-v2-current.json"
+    other_provider = directory / "codex-v2-expired.json"
+    write_json(expired, {"expires_at": 200})
+    write_json(current, {"expires_at": 201})
+    write_json(other_provider, {"expires_at": 100})
+    legacy = directory / "claude-old-session"
+    recent_legacy = directory / "codex-recent-session"
+    legacy.write_text("旧形式", encoding="utf-8")
+    recent_legacy.write_text("旧形式", encoding="utf-8")
+    os.utime(legacy, (200 - 5 * 60 * 60, 200 - 5 * 60 * 60))
+    os.utime(recent_legacy, (200, 200))
+    unrelated = directory / "unrelated"
+    unrelated.write_text("保持", encoding="utf-8")
+
+    payload = {"session_id": "shared", "hook_event_name": "PreToolUse"}
+    assert usage_guard.guard("claude", payload, tmp_path) is None
+    assert set(directory.iterdir()) == {current, recent_legacy, unrelated}
 
 
 def test_threshold_config_and_override(tmp_path, monkeypatch):
