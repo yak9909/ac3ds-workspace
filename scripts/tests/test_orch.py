@@ -160,6 +160,12 @@ def precheck_args(ws):
     return ["--precheck", str(ws / "_local" / "precheck.md")]
 
 
+def read_args(ws):
+    src = ws / "_local" / "read.md"
+    src.write_text("ワーカーの報告\n関係する資料の本文\n", encoding="utf-8")
+    return ["--read", str(src)]
+
+
 def dispatch(env, idb=True):
     ws = env[0]
     a = ["dispatch", "5", "--worker", "sonnet-5.5", *precheck_args(ws)]
@@ -421,11 +427,11 @@ def test_stamp_outside_change_can_be_allowed(env, capsys):
 
 def test_accept_order_errors(env):
     ws, fake, origin, wt = ready(env)
-    assert run("accept", "5", "--scores", SCORES) == 1  # stamp 前
+    assert run("accept", "5", *read_args(ws), "--scores", SCORES) == 1  # stamp 前
     run("stamp", "5")
     (wt / "docs").mkdir(exist_ok=True)
     (wt / "docs" / "late.md").write_text("late\n", encoding="utf-8")
-    assert run("accept", "5", "--scores", SCORES) == 1  # stamp 後の変更
+    assert run("accept", "5", *read_args(ws), "--scores", SCORES) == 1  # stamp 後の変更
     assert not fake.named("pr", "merge")
 
 
@@ -433,7 +439,7 @@ def test_accept_dry_run_writes_nothing(env, capsys):
     ws, fake, origin, wt = ready(env)
     run("stamp", "5")
     before = (tasks(ws), g(wt, "rev-parse", "HEAD"), len(fake.calls))
-    assert run("accept", "5", "--scores", SCORES, "--dry-run") == 0
+    assert run("accept", "5", *read_args(ws), "--scores", SCORES, "--dry-run") == 0
     assert (tasks(ws), g(wt, "rev-parse", "HEAD"), len(fake.calls)) == before
     assert (wt / ".task").exists()
     assert run("reject", "5", "--reason", "x", "--dry-run") == 0
@@ -443,7 +449,7 @@ def test_accept_dry_run_writes_nothing(env, capsys):
 def test_accept_full(env):
     ws, fake, origin, wt = ready(env)
     run("stamp", "5")
-    assert run("accept", "5", "--scores", SCORES) == 0
+    assert run("accept", "5", *read_args(ws), "--scores", SCORES) == 0
     t = tasks(ws)["ac3ds-re#5"]
     assert t["state"] == "accepted" and t["idb_import"] == "未実装"
     assert not (wt / ".task").exists()
@@ -470,7 +476,7 @@ def test_pause_unpause_and_refused_commands(env, capsys):
     out = capsys.readouterr().out
     assert "== 保留中のタスク ==" in out and "ac3ds-re#5" in out
     assert "== 動いているタスク ==\nなし" in out
-    for args in (("save", "5"), ("stamp", "5"), ("accept", "5", "--scores", SCORES),
+    for args in (("save", "5"), ("stamp", "5"), ("accept", "5", *read_args(ws), "--scores", SCORES),
                  ("codex", "5")):
         assert run(*args) == 1
         assert "先に unpause" in capsys.readouterr().err
@@ -523,7 +529,7 @@ def test_accept_syncs_skills_after_merge(env, monkeypatch, changed):
     monkeypatch.setattr(orch.sync_skills, "check", lambda root: ["workspace skills mismatch"])
     calls = []
     monkeypatch.setattr(orch.sync_skills, "sync", lambda root: calls.append(root) or [])
-    assert run("accept", "5", "--scores", SCORES) == 0
+    assert run("accept", "5", *read_args(ws), "--scores", SCORES) == 0
     assert calls == [ws]
 
 
@@ -572,7 +578,7 @@ def test_accept_waits_for_checks_of_pushed_commit(env, capsys):
     ws, fake, origin, wt = ready(env)
     run("stamp", "5")
     fake.checks_script = [None, None, [{"name": "audit", "bucket": "pending"}], [{"name": "audit", "bucket": "pass"}]]
-    assert run("accept", "5", "--scores", SCORES) == 0, capsys.readouterr().err
+    assert run("accept", "5", *read_args(ws), "--scores", SCORES) == 0, capsys.readouterr().err
     assert len(fake.named("pr", "checks")) == 4
     assert fake.named("pr", "merge")
 
@@ -581,7 +587,7 @@ def test_accept_waits_until_pr_head_is_pushed_commit(env):
     ws, fake, origin, wt = ready(env)
     run("stamp", "5")
     fake.view_lag = 2
-    assert run("accept", "5", "--scores", SCORES) == 0
+    assert run("accept", "5", *read_args(ws), "--scores", SCORES) == 0
     assert len(fake.named("pr", "view")) >= 3
 
 
@@ -590,7 +596,7 @@ def test_accept_stops_when_required_check_never_appears(env, capsys, monkeypatch
     run("stamp", "5")
     monkeypatch.setattr(orch, "CHECK_APPEAR_SEC", 0)
     fake.checks_script = [None]
-    assert run("accept", "5", "--scores", SCORES) == 1
+    assert run("accept", "5", *read_args(ws), "--scores", SCORES) == 1
     assert "必須: audit" in capsys.readouterr().err
     assert not fake.named("pr", "merge")
     assert tasks(ws)["ac3ds-re#5"]["state"] == "stamped"
@@ -602,7 +608,7 @@ def test_accept_without_required_checks_warns(env, capsys, monkeypatch):
     monkeypatch.setattr(orch, "CHECK_APPEAR_SEC", 0)
     fake.protection = None
     fake.checks_script = [None]
-    assert run("accept", "5", "--scores", SCORES) == 0
+    assert run("accept", "5", *read_args(ws), "--scores", SCORES) == 0
     assert "警告: チェックが1つも無い" in capsys.readouterr().out
     assert fake.named("pr", "merge")
 
@@ -611,9 +617,9 @@ def test_accept_resumes_after_its_own_prep_commit(env):
     ws, fake, origin, wt = ready(env)
     run("stamp", "5")
     fake.fail["pr ready"] = 1
-    assert run("accept", "5", "--scores", SCORES) == 1  # 準備のコミットを作った後で失敗
+    assert run("accept", "5", *read_args(ws), "--scores", SCORES) == 1  # 準備のコミットを作った後で失敗
     assert tasks(ws)["ac3ds-re#5"]["state"] == "stamped"
-    assert run("accept", "5", "--scores", SCORES) == 0
+    assert run("accept", "5", *read_args(ws), "--scores", SCORES) == 0
     assert tasks(ws)["ac3ds-re#5"]["state"] == "accepted"
 
 
@@ -621,10 +627,10 @@ def test_accept_refuses_change_after_prep_commit(env):
     ws, fake, origin, wt = ready(env)
     run("stamp", "5")
     fake.fail["pr ready"] = 1
-    assert run("accept", "5", "--scores", SCORES) == 1
+    assert run("accept", "5", *read_args(ws), "--scores", SCORES) == 1
     (wt / "docs").mkdir(exist_ok=True)
     (wt / "docs" / "x.md").write_text("x\n", encoding="utf-8")
-    assert run("accept", "5", "--scores", SCORES) == 1
+    assert run("accept", "5", *read_args(ws), "--scores", SCORES) == 1
     assert not fake.named("pr", "merge")
 
 
@@ -960,7 +966,7 @@ def test_pass_min_comes_from_workers_toml():
 def test_accept_refuses_wrong_score_names(env, capsys):
     ws, fake, origin, wt = ready(env)
     run("stamp", "5")
-    assert run("accept", "5", "--scores", "a=0.9") == 1
+    assert run("accept", "5", *read_args(ws), "--scores", "a=0.9") == 1
     assert "採点の項目が違う" in capsys.readouterr().err
     assert not fake.named("pr", "merge")
 
@@ -1050,12 +1056,12 @@ def test_stamp_flags_deep_review_for_names_in_derived_api(env, capsys, api, expe
 def test_accept_needs_reviewed_when_deep_review_required(env, capsys):
     ws, fake, wt = symbol_change(env, 'functions = ["renamed_fn"]\n')
     run("stamp", "5")
-    assert run("accept", "5", "--scores", SCORES) == 1
+    assert run("accept", "5", *read_args(ws), "--scores", SCORES) == 1
     assert "--reviewed" in capsys.readouterr().err
     assert not fake.named("pr", "merge")
     review = ws / "_local" / "review.md"
     review.write_text("深い検証: renamed_fn を IDB で確かめた（試験）\n", encoding="utf-8")
-    assert run("accept", "5", "--scores", SCORES, "--reviewed", str(review)) == 0
+    assert run("accept", "5", *read_args(ws), "--scores", SCORES, "--reviewed", str(review)) == 0
     bodies = [args[args.index("--body") + 1] for args, _ in fake.named("pr", "comment")]
     assert any(b.startswith("深い検証の報告:") and "renamed_fn を IDB" in b for b in bodies)
     assert tasks(ws)["ac3ds-re#5"]["state"] == "accepted"

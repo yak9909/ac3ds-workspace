@@ -1721,6 +1721,11 @@ def cmd_accept(a) -> int:
     key = tkey(a.repo, a.issue)
     scores = parse_scores(a.scores)
     check_scores(scores, role, pass_min(c))
+    read = read_source(a.read).strip()
+    if not read:
+        raise OrchError("採点の前に読んだ物の一覧が空: %s" % a.read)
+    if len([line for line in read.splitlines() if line.strip()]) < 2:
+        raise OrchError("読んだ物は 2 つ以上書く（報告だけで採点しない）")
     wt = Path(t["worktree"])
     if t.get("state") != "stamped":
         raise OrchError("状態が %s。先に stamp が要る" % t.get("state"))
@@ -1737,6 +1742,7 @@ def cmd_accept(a) -> int:
         raise OrchError("深い検証の報告が空: %s" % a.reviewed)
     slug = repo_slug(c, a.repo)
     comment = "合格\n\n採点: " + ", ".join("%s=%g" % kv for kv in scores.items())
+    comment += "\n\n採点の前に読んだ物:\n\n" + read
     review_comment = "深い検証の報告:\n\n" + reviewed if reviewed else ""
     if a.dry_run:
         print("dry-run: 次を行う（何も書かない）")
@@ -1962,6 +1968,7 @@ def main(argv=None) -> int:
     s = add("accept", cmd_accept, dry=True)
     s.add_argument("issue", type=int)
     s.add_argument("--scores", required=True)
+    s.add_argument("--read", required=True, help="採点の前に読んだ物の一覧のファイル（- は標準入力）。PR のコメントに残す")
     s.add_argument("--reviewed", help="深い検証の報告のファイル（- は標準入力）。PR のコメントに残す")
     s.add_argument("--keep", action="store_true")
     s = add("reject", cmd_reject, dry=True)
