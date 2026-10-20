@@ -1026,6 +1026,7 @@ def cmd_dispatch(a) -> int:
     auto = auto_addr_section(c, issue.get("body") or "", precheck)
     text = tpl.read_text(encoding="utf-8").format(
         repo=a.repo, goal=goal, worktree=str(wt),
+        evidence=(c.root / "_local" / "evidence" / ("%s-%d" % (a.repo, a.issue))).as_posix(),
         idb_line=("、IDB の作業用コピー %s" % idb["path"]) if idb else "",
         materials=sec.get("関係する資料", "").strip() or "なし",
         precheck=precheck + ("\n\n" + auto if auto else ""),
