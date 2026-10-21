@@ -80,6 +80,44 @@ def test_error_without_reset_expires_after_five_hours(tmp_path):
     assert capacity.codex_limit_until(tmp_path, NOW + dt.timedelta(hours=5)) is None
 
 
+def local_at(year, month, day, hour, minute):
+    return dt.datetime(year, month, day, hour, minute).astimezone(dt.timezone.utc)
+
+
+def write_limit(path, message, timestamp=None):
+    event = {"type": "error", "message": message}
+    if timestamp is not None:
+        event["timestamp"] = timestamp.isoformat()
+    path.write_text(json.dumps(event), encoding="utf-8")
+
+
+def test_time_only_reset_uses_log_local_day(tmp_path):
+    log_time = local_at(2026, 10, 18, 11, 23)
+    write_limit(tmp_path / "codex_one.jsonl", "You've hit your usage limit. Try again later or try again at 3:36 PM.",
+                log_time)
+    assert capacity.codex_limit_until(tmp_path, log_time) == local_at(2026, 10, 18, 15, 36)
+    assert capacity.codex_limit_until(tmp_path, local_at(2026, 10, 18, 15, 36)) is None
+
+
+def test_time_only_reset_rolls_over_midnight(tmp_path):
+    log_time = local_at(2026, 10, 18, 23, 50)
+    write_limit(tmp_path / "codex_one.jsonl", "usage limit reached, try again at 1:10 AM.", log_time)
+    assert capacity.codex_limit_until(tmp_path, log_time) == local_at(2026, 10, 19, 1, 10)
+
+
+def test_usage_reset_after_error_ends_limit(tmp_path):
+    log_time = local_at(2026, 10, 18, 11, 23)
+    write_limit(tmp_path / "codex_one.jsonl", "usage limit reached, try again at 3:36 PM.", log_time)
+    now = local_at(2026, 10, 18, 14, 0)
+    until = local_at(2026, 10, 18, 15, 36)
+    assert capacity.codex_limit_until(tmp_path, now) == until
+    # 上限エラーより後で、今より前に resets_at が来ていれば、リセット済み
+    assert capacity.codex_limit_until(tmp_path, now, local_at(2026, 10, 18, 13, 0).timestamp()) is None
+    # エラーより前の resets_at や、今より後の resets_at では効かない
+    assert capacity.codex_limit_until(tmp_path, now, local_at(2026, 10, 18, 10, 0).timestamp()) == until
+    assert capacity.codex_limit_until(tmp_path, now, local_at(2026, 10, 18, 15, 0).timestamp()) == until
+
+
 def test_stats_rows():
     rows = orch.stats_rows({
         "one": {"worker": "sonnet", "state": "accepted", "attempts": 2, "git_violation": "HEAD",

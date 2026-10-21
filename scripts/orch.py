@@ -346,7 +346,8 @@ def capacity_reports(c: Ctx, extra_issue=None) -> dict:
             provider, issues, tasks, c.workers.get("workers", {}), limits,
             usage[provider].get("five_hour_used_percent"),
             usage[provider].get("resets_at"), current,
-            capacity.codex_limit_until(c.data / "logs", current) if provider == "codex" else None)
+            capacity.codex_limit_until(c.data / "logs", current, usage["codex"].get("resets_at"))
+            if provider == "codex" else None)
         for provider in ("claude", "codex")
     }
 

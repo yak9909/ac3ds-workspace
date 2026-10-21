@@ -19,6 +19,8 @@ ENGLISH_RESET = re.compile(
     r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|"
     r"Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+"
     r"(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\s+(\d{1,2}):(\d{2})\s*(AM|PM)\b", re.I)
+ENGLISH_TIME_RESET = re.compile(
+    r"\b(?:try again at|resets? at)\s+(\d{1,2}):(\d{2})\s*(AM|PM)\b", re.I)
 MONTHS = {name: month for month, name in enumerate(
     ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
 
@@ -95,11 +97,35 @@ def hourly_rates(tasks, defaults):
             for m, v in defaults.items()}
 
 
-def codex_limit_until(log_dir, now):
+def reset_instant(value):
+    """usage.json の resets_at（エポック秒、その文字列、ISO 文字列のいずれも）を UTC の時刻にする。"""
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            pass
+    return instant(value)
+
+
+def clock_reset(hour, minute, meridiem, when):
+    """日付の無い「at H:MM AM/PM」を、ログ行の時刻 when の現地の日付で読む。when より前なら翌日。"""
+    local = when.astimezone()
+    wall = dt.datetime.combine(local.date(), dt.time(
+        int(hour) % 12 + (12 if meridiem.upper() == "PM" else 0), int(minute)))
+    if wall < local.replace(tzinfo=None):
+        wall += dt.timedelta(days=1)
+    return wall.astimezone(dt.timezone.utc)
+
+
+def codex_limit_until(log_dir, now, usage_reset=None):
+    """Codex の上限エラーが続く時刻を返す。読めなければ、ログの更新時刻 + 5 時間。
+    usage_reset（使用率の5時間枠の resets_at）が上限エラーの後で、今より前なら解除済みとして None。"""
     if not log_dir.is_dir():
         return None
+    window_end = reset_instant(usage_reset)
     for path in sorted(log_dir.glob("codex_*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]:
-        fallback = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc) + dt.timedelta(hours=5)
+        mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc)
+        fallback = mtime + dt.timedelta(hours=5)
         for line in reversed(path.read_text(encoding="utf-8", errors="replace").splitlines()[-200:]):
             try:
                 event = json.loads(line)
@@ -112,6 +138,9 @@ def codex_limit_until(log_dir, now):
                 message = event["error"].get("message")
             if not isinstance(message, str) or not LIMIT_ERROR.search(message):
                 continue
+            when = instant(event.get("timestamp")) or mtime
+            if window_end is not None and when < window_end <= now:
+                return None
             iso = RESET.search(message)
             reset = instant(iso.group(1)) if iso else None
             if reset is None and (english := ENGLISH_RESET.search(message)):
@@ -120,6 +149,11 @@ def codex_limit_until(log_dir, now):
                     local = dt.datetime(int(year), MONTHS[month[:3].lower()], int(day),
                                         int(hour) % 12 + (12 if meridiem.upper() == "PM" else 0), int(minute))
                     reset = local.astimezone(dt.timezone.utc)
+                except ValueError:
+                    pass
+            if reset is None and (clock := ENGLISH_TIME_RESET.search(message)):
+                try:
+                    reset = clock_reset(*clock.groups(), when)
                 except ValueError:
                     pass
             until = reset or fallback
