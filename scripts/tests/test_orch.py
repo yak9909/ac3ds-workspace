@@ -744,6 +744,29 @@ def test_codex_runs_and_saves_log_and_report(env, capsys, monkeypatch):
         "（ワーカーの最終の返答をオーケストラが保存した）\n最後の返答です\n"
 
 
+def test_codex_stopped_by_guard_keeps_log_and_resumable(env, capsys, monkeypatch):
+    """実行中に利用枠が閾値に達したら止める。台帳と終了コードが合い、止めるまでの出力で --resume できる。"""
+    ws, fake, _ = env
+    monkeypatch.setenv("AC3DS_GUARD_THRESHOLD", "80")
+    monkeypatch.setattr(orch.usage_watch, "GUARD_INTERVAL_SEC", 0.5)
+    monkeypatch.setattr(orch.usage_watch, "five_hour_percent", lambda *_: 85)
+    assert run("dispatch", "5", "--worker", "gpt-6-sol", *precheck_args(ws)) == 0
+    monkeypatch.setattr(orch, "find_codex", lambda: "codex")
+    child = ("import json, time\n"
+             "print(json.dumps({'type': 'thread.started', 'thread_id': 't9'}), flush=True)\n"
+             "time.sleep(60)\n")
+    monkeypatch.setattr(orch, "codex_cmd", lambda c, wt, exe, model, effort, *rest: [sys.executable, "-c", child])
+    assert run("codex", "5") == orch.CODEX_STOPPED_RC
+    out = capsys.readouterr().out
+    assert "利用枠の 85% で Codex を止めた。続きは orch.py codex --resume で頼む" in out
+    t = tasks(ws)["ac3ds-re#5"]
+    assert t["codex_stopped_at_usage"] == 85 and t["state"] == "dispatched"
+    log = Path(t["codex_log"])
+    assert orch.codex_thread_id(log.read_text(encoding="utf-8")) == "t9"
+    wt = Path(t["worktree"])
+    assert not (wt / ".task" / "report.md").exists()  # 止めた回は報告を保存しない
+
+
 def test_codex_keeps_existing_report_and_numbers_logs(env, monkeypatch):
     ws, fake, _ = env
     run("dispatch", "5", "--worker", "gpt-6-sol", *precheck_args(ws))

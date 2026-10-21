@@ -2,6 +2,8 @@ import io
 import json
 import os
 import subprocess
+import sys
+import time
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
@@ -269,3 +271,126 @@ def test_expire_independent_windows():
     assert usage_watch.expire(original, 100)["weekly_used_percent"] == 90
     assert usage_watch.expire(original, 200)["weekly_used_percent"] == 0
     assert original["five_hour_used_percent"] == 85
+
+
+def rate_event(limit_id, primary, secondary, stamp):
+    return {"timestamp": stamp, "type": "event_msg", "payload": {"type": "token_count", "rate_limits": {
+        "limit_id": limit_id, "primary": primary, "secondary": secondary}}}
+
+
+def write_lines(path, events):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in events) + "\n", encoding="utf-8")
+
+
+CODEX_WINDOWS = {"used_percent": 99.0, "window_minutes": 300, "resets_at": 1792564564}
+CODEX_WEEK = {"used_percent": 54.0, "window_minutes": 10080, "resets_at": 1793090245}
+
+
+def test_codex_usage_skips_null_premium_at_end(tmp_path):
+    """実際のログの形: 最後の token_count は premium で窓が null。その手前の codex の値を使う。"""
+    sessions = tmp_path / "sessions"
+    write_lines(sessions / "2026/10/21/rollout-2026-10-21T10-35-52-a.jsonl", [
+        {"type": "session_meta", "payload": {}},
+        rate_event("codex", CODEX_WINDOWS, CODEX_WEEK, "2026-10-21T01:00:00Z"),
+        rate_event("premium", None, None, "2026-10-21T01:05:00Z"),
+    ])
+    data = usage_watch.collect(tmp_path, sessions=sessions, now=1792000000)
+    assert data["codex"]["five_hour_used_percent"] == 99.0
+    assert data["codex"]["resets_at"] == 1792564564
+    assert data["codex"]["weekly_used_percent"] == 54.0
+
+
+def test_codex_usage_prefers_codex_limit_and_newest_file(tmp_path):
+    sessions = tmp_path / "sessions"
+    # 新しい更新時刻のファイルは、窓の無い行しか無い（別のワーカーが書き始めたばかり）
+    empty = sessions / "b/rollout-b.jsonl"
+    write_lines(empty, [rate_event("premium", None, None, "2026-10-21T02:00:00Z")])
+    older = sessions / "a/rollout-a.jsonl"
+    write_lines(older, [
+        rate_event("codex", CODEX_WINDOWS, None, "2026-10-21T01:00:00Z"),
+        rate_event("premium", {"used_percent": 90.0, "window_minutes": 300, "resets_at": 1792564564},
+                   None, "2026-10-21T01:30:00Z"),
+    ])
+    os.utime(older, (10, 10))
+    os.utime(empty, (20, 20))
+    data = usage_watch.codex_usage(sessions, 1792000000)
+    assert data["five_hour_used_percent"] == 99.0  # 後ろの premium より limit_id が codex の物を優先
+
+
+def test_codex_usage_newest_valid_across_files(tmp_path):
+    sessions = tmp_path / "sessions"
+    newer_mtime = sessions / "x/rollout-x.jsonl"
+    write_lines(newer_mtime, [rate_event("codex", {"used_percent": 10.0, "window_minutes": 300, "resets_at": 1792564564},
+                                         None, "2026-10-21T01:00:00Z")])
+    older_mtime = sessions / "y/rollout-y.jsonl"
+    write_lines(older_mtime, [rate_event("codex", {"used_percent": 50.0, "window_minutes": 300, "resets_at": 1792564564},
+                                         None, "2026-10-21T02:00:00Z")])
+    os.utime(newer_mtime, (30, 30))
+    os.utime(older_mtime, (20, 20))
+    assert usage_watch.codex_usage(sessions, 1792000000)["five_hour_used_percent"] == 50.0
+
+
+def test_codex_usage_none_when_no_window(tmp_path):
+    sessions = tmp_path / "sessions"
+    write_lines(sessions / "a/rollout-a.jsonl", [rate_event("premium", None, None, "2026-10-21T01:00:00Z")])
+    assert usage_watch.codex_usage(sessions, 100) is None
+    assert usage_watch.codex_usage(tmp_path / "absent", 100) is None
+
+
+# ---------- 実行中の見張り ----------
+def test_run_with_guard_stops_child_tree_at_threshold(tmp_path):
+    marker = tmp_path / "grandchild-alive.txt"
+    ready = tmp_path / "ready.txt"
+    grand = "import pathlib,sys,time; time.sleep(2); pathlib.Path(sys.argv[1]).write_text('alive')"
+    # 子の子を作り終えてから、印を書く。作る途中で止めると、子の子が木の外に残る（試験の前提）
+    parent = ("import pathlib,subprocess,sys,time\n"
+              "subprocess.Popen([sys.executable, '-c', sys.argv[2], sys.argv[1]])\n"
+              "pathlib.Path(sys.argv[3]).write_text('ready')\n"
+              "print('開始', flush=True)\ntime.sleep(60)\n")
+    reads = []
+
+    def usage():
+        reads.append(1)
+        return 85 if ready.exists() else 10
+
+    started = time.monotonic()
+    r = usage_watch.run_with_guard([sys.executable, "-c", parent, str(marker), grand, str(ready)], root=tmp_path,
+                                   threshold_pct=80, interval=0.2, usage=usage)
+    assert time.monotonic() - started < 30
+    assert r.stopped is True and r.used_percent == 85 and r.returncode != 0
+    assert "開始" in r.stdout and reads
+    time.sleep(3)  # 子の子が生きていれば、2 秒後に印を書く
+    assert not marker.exists()
+
+
+def test_run_with_guard_below_threshold_runs_to_end(tmp_path):
+    cmd = [sys.executable, "-c", "import time; time.sleep(0.6); print('終わり')"]
+    reads = []
+
+    def usage():
+        reads.append(1)
+        return 79.9
+
+    r = usage_watch.run_with_guard(cmd, root=tmp_path, threshold_pct=80, interval=0.1, usage=usage)
+    assert r.stopped is False and r.used_percent is None and r.returncode == 0
+    assert "終わり" in r.stdout and reads
+
+
+def test_run_with_guard_unknown_usage_never_stops(tmp_path):
+    cmd = [sys.executable, "-c", "import time; time.sleep(0.5)"]
+    r = usage_watch.run_with_guard(cmd, root=tmp_path, threshold_pct=80, interval=0.1, usage=lambda: None)
+    assert r.stopped is False and r.returncode == 0
+
+
+def test_run_with_guard_feeds_stdin(tmp_path):
+    cmd = [sys.executable, "-c", "import sys; print('受けた: ' + sys.stdin.read())"]
+    r = usage_watch.run_with_guard(cmd, input_text="依頼文", root=tmp_path, usage=lambda: None)
+    assert r.returncode == 0 and "受けた: 依頼文" in r.stdout
+
+
+def test_five_hour_percent_failure_is_none(tmp_path, monkeypatch):
+    def fail(*_, **__):
+        raise PermissionError("読めない")
+    monkeypatch.setattr(usage_watch, "collect", fail)
+    assert usage_watch.five_hour_percent(tmp_path, "codex") is None

@@ -1237,14 +1237,30 @@ def real_pwsh_dir() -> str | None:
     return str(Path(max(found, key=ver)).parent) if found else None
 
 
+CODEX_STOPPED_RC = 3  # 利用枠の上限で Codex を止めたときの終了コード（続きは --resume）
+
+
+class CodexStopped(OrchError):
+    """見張りが利用枠の閾値で Codex を止めた。止めるまでの出力を持つ。"""
+
+    def __init__(self, used_percent, code, stdout, stderr):
+        super().__init__("利用枠の %g%% で Codex を止めた" % used_percent)
+        self.used_percent = used_percent
+        self.code = code
+        self.stdout = stdout
+        self.stderr = stderr
+
+
 def run_codex(c: Ctx, cmd: list[str], cwd: Path, prompt: str) -> tuple[int, str, str]:
-    """codex を起動し、終わるまで待つ。試験ではこの関数を差し替える。"""
+    """codex を起動し、終わるまで待つ。実行中は利用枠を見張り、閾値以上なら止めて CodexStopped を投げる。
+    試験ではこの関数を差し替える。"""
     env = child_env(c)
     d = real_pwsh_dir()
     if d:
         env["PATH"] = d + os.pathsep + env.get("PATH", "")
-    r = subprocess.run(cmd, cwd=str(cwd), input=prompt, capture_output=True, text=True, encoding="utf-8",
-                       errors="replace", env=env)
+    r = usage_watch.run_with_guard(cmd, input_text=prompt, cwd=str(cwd), env=env, root=c.root, provider="codex")
+    if r.stopped:
+        raise CodexStopped(r.used_percent, r.returncode, r.stdout, r.stderr)
     return r.returncode, r.stdout, r.stderr
 
 
@@ -1357,8 +1373,13 @@ def cmd_codex(a) -> int:
         return 0
     log = next_log(c, a.repo, a.issue)
     before = git_launch_state(c, wt) if idb else None
+    stopped = None
     try:
-        code, out, err = run_codex(c, cmd, wt, prompt)
+        try:
+            code, out, err = run_codex(c, cmd, wt, prompt)
+        except CodexStopped as s:
+            stopped = s
+            code, out, err = s.code, s.stdout, s.stderr
     finally:
         if before is not None:
             violation = git_launch_violation(before, git_launch_state(c, wt))
@@ -1367,6 +1388,12 @@ def cmd_codex(a) -> int:
                 update_task(c, key, git_violation=violation)
     log.write_text(out, encoding="utf-8", newline="\n")
     update_task(c, key, codex_log=str(log), codex_finished_at=now())
+    if stopped is not None:
+        # 止めるまでの出力は保存済み（thread_id が残り、--resume で続けられる）。報告は続きの実行で保存する
+        update_task(c, key, codex_stopped_at_usage=stopped.used_percent, codex_stopped_at=now())
+        print("利用枠の %g%% で Codex を止めた。続きは orch.py codex --resume で頼む" % stopped.used_percent)
+        print("ログ: %s" % log)
+        return CODEX_STOPPED_RC
     nerr = sum("ERROR" in x for x in out.splitlines() + err.splitlines())
     print("codex の終了コード: %d（モデル %s、effort %s）" % (code, model, effort))
     print("エラー行（ERROR を含む）: %d 件" % nerr)
