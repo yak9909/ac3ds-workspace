@@ -1207,7 +1207,8 @@ def codex_cmd(c: Ctx, wt: Path, exe: str, model: str, effort: str, idb_path: str
     command = subprocess.list2cmdline([python, guard, "--provider", "codex"])
     hook = ('hooks.PostToolUse=[{matcher=".*",hooks=[{type="command",command='
             + json.dumps(command, ensure_ascii=False) + ',timeout=10}]}]')
-    hook_args = ["--dangerously-bypass-hook-trust", "-c", hook]
+    # 既存の資料をワーカーが自分で探せるよう、ウェブ検索を有効にする。
+    hook_args = ["--dangerously-bypass-hook-trust", "-c", hook, "-c", 'web_search="live"']
     if thread_id:
         cmd = [exe, "exec", "resume", thread_id]
         if idb_path:
