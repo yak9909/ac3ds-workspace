@@ -1,5 +1,9 @@
 import csv
 import hashlib
+import os
+import re
+import shutil
+import subprocess
 import tempfile
 import unittest
 import zlib
@@ -228,6 +232,108 @@ class ExportGameApiTests(unittest.TestCase):
         self.assertIn("using ThumbFunc_t = int (*)(std::int8_t a, std::uint64_t *b);", content)
         for leftover in ("signed std::", "unsigned std::", "__int"):
             self.assertNotIn(leftover, content)
+
+    ENUM_TYPES = (
+        "// type: Mode\nenum Mode\n{\n  Mode_A = 0x0,\n  Mode_B = 0x1,\n};\n"
+        "// type: Flags\nenum __bitmask Flags\n{\n  Flags_X = 0x1,\n  Flags_Y = 0x2,\n};\n"
+        "// type: Small\nenum Small : unsigned __int8\n{\n  Small_A = 0x0,\n  Small_B = 0x3,\n};\n"
+        "// type: Half\nenum __bitmask Half : __int16\n{\n  Half_A = -1,\n};\n"
+        "// type: Wide\nenum Wide : unsigned __int64\n{\n  Wide_A = 0x1,\n};\n"
+        "// type: Signed\nenum Signed\n{\n  Signed_A = -1,\n  Signed_B = 0x7FFFFFFF,\n};\n"
+        "// type: Big\nenum Big\n{\n  Big_A = 0xFFFFFFFF,\n};\n"
+        "// type: Mix\n#pragma pack(push, 2)\nstruct Mix\n{\n  unsigned __int8 a;\n  Mode m;\n  Small s;\n"
+        "  unsigned __int16 b;\n  Flags f;\n  Half h;\n  signed __int8 c;\n  Wide w;\n  Signed g;\n  Big z;\n};\n"
+        "#pragma pack(pop)\n")
+    ENUM_SIZES = {"Mode": 4, "Flags": 4, "Small": 1, "Half": 2, "Wide": 8, "Signed": 4, "Big": 4}
+    MIX_FIELDS = [("a", 1), ("m", 4), ("s", 1), ("b", 2), ("f", 4), ("h", 2), ("c", 1), ("w", 8), ("g", 4), ("z", 4)]
+
+    def enum_header(self):
+        (self.symbols / "types/enums.h").write_text(self.ENUM_TYPES, encoding="utf-8")
+        self.config(types='["Node", "Mix"]')
+        return api.generate(self.repo)
+
+    def test_enums_get_fixed_base_and_size_assert(self):
+        content = self.enum_header().read_text(encoding="utf-8")
+        for declaration in ("enum Mode : std::uint32_t\n{", "enum Flags : std::uint32_t\n{",
+                            "enum Small : std::uint8_t\n{", "enum Half : std::int16_t\n{",
+                            "enum Wide : std::uint64_t\n{", "enum Signed : std::int32_t\n{",
+                            "enum Big : std::uint32_t\n{"):
+            self.assertIn(declaration, content)
+        for name, size in self.ENUM_SIZES.items():
+            self.assertIn(f"}};\nstatic_assert(sizeof({name}) == {size});\n", content)
+            self.assertLess(content.index(f"enum {name} :"), content.index(f"static_assert(sizeof({name})"))
+        self.assertNotIn("__bitmask", content)
+        self.assertEqual(content.count("static_assert"), len(self.ENUM_SIZES))
+
+    def test_unusual_enums_are_errors(self):
+        for body, message in (("enum Anon\n{\n  A = 1,\n};\nenum { B };\n", "名前の無い enum"),
+                              ("enum Bad : unsigned long\n{\n  A = 1,\n};\n", "基底型"),
+                              ("enum Mixed\n{\n  A = -1,\n  B = 0x80000000,\n};\n", "負の値")):
+            with self.subTest(body=body):
+                (self.symbols / "types/enums.h").write_text("// type: Bad\n" + body, encoding="utf-8")
+                self.config(types='["Node", "Bad"]')
+                with self.assertRaisesRegex(ValueError, message):
+                    api.generate(self.repo)
+
+    def test_output_uses_lf_line_endings(self):
+        self.assertNotIn(b"\r", self.enum_header().read_bytes())
+
+    @staticmethod
+    def compilers():
+        found = []
+        for name, hint in (("arm-none-eabi-g++", "C:/devkitPro/devkitARM/bin"), ("g++", None), ("c++", None)):
+            path = shutil.which(name) or (shutil.which(name, path=hint) if hint else None)
+            if not path or os.path.normcase(os.path.realpath(path)) in [os.path.normcase(os.path.realpath(p)) for p in found]:
+                continue
+            # 壊れた環境のコンパイラ（PATH 不足で何も出さずに失敗する物）は使わない。
+            probe = subprocess.run([path, "-x", "c++", "-fsyntax-only", "-"], input="int main() {}\n",
+                                   capture_output=True, text=True, timeout=120)
+            if probe.returncode == 0:
+                found.append(path)
+        return found
+
+    def expected_offsets(self):
+        # IDA の配置: 欄は自分の大きさに揃え、#pragma pack(2) で 2 を上限にする。enum は宣言の大きさ。
+        offsets, position = {}, 0
+        for field, size in self.MIX_FIELDS:
+            align = min(size, 2)
+            position = -(-position // align) * align
+            offsets[field] = position
+            position += size
+        return offsets, -(-position // 2) * 2
+
+    def layout_source(self):
+        offsets, total = self.expected_offsets()
+        asserts = [f"static_assert(offsetof(Mix, {field}) == {offset}, \"{field}\");" for field, offset in offsets.items()]
+        return ('#include <cstddef>\n#include "enums_api.h"\nusing namespace gohan_test;\n'
+                + "\n".join(asserts) + f"\nstatic_assert(sizeof(Mix) == {total}, \"Mix\");\n")
+
+    def compile(self, compiler, header_text):
+        folder = self.root / "compile"
+        folder.mkdir(exist_ok=True)
+        (folder / "enums_api.h").write_text(header_text, encoding="utf-8")
+        (folder / "layout.cpp").write_text(self.layout_source(), encoding="utf-8")
+        return subprocess.run([compiler, "-std=gnu++17", "-fsyntax-only", "-I", str(folder), str(folder / "layout.cpp")],
+                              capture_output=True, text=True, timeout=120)
+
+    def test_generated_enum_layout_matches_ida_with_real_compilers(self):
+        (self.repo / "game_api.toml").write_text(
+            'build = "sample"\noutput = "include/game_api.h"\nnamespace = "gohan_test"\n'
+            'functions = []\nglobals = []\ntypes = ["Mix"]\n', encoding="utf-8")
+        (self.symbols / "types/enums.h").write_text(self.ENUM_TYPES, encoding="utf-8")
+        header = api.generate(self.repo).read_text(encoding="utf-8")
+        compilers = self.compilers()
+        if not compilers:
+            self.skipTest("C++ コンパイラがありません")
+        for compiler in compilers:
+            with self.subTest(compiler=compiler):
+                result = self.compile(compiler, header)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        # 基底型を外すと、short enums の devkitARM では位置も大きさも合わなくなる（検査が効いている確認）。
+        arm = [c for c in compilers if "arm-none-eabi" in c]
+        if arm:
+            stripped = re.sub(r"(enum \w+) : std::u?int\d+_t", r"\1", header)
+            self.assertNotEqual(self.compile(arm[0], stripped).returncode, 0)
 
 
 if __name__ == "__main__":

@@ -170,6 +170,51 @@ def cpp_syntax(code: str) -> str:
     return code
 
 
+ENUM_DEFINITION = re.compile(r"\benum\s+([A-Za-z_][A-Za-z_0-9]*)(?:\s*:\s*([^{};]+?))?(\s*)\{")
+ENUM_ANONYMOUS = re.compile(r"\benum\s*(?:\{|:)")
+ENUM_BASE = re.compile(r"std::(u?)int(8|16|32|64)_t")
+ENUM_VALUE = re.compile(r"=\s*(-?)\s*(0[xX][0-9A-Fa-f]+|\d+)")
+
+
+def fixed_enums(code: str, owner: str) -> str:
+    """enum に IDA と同じ大きさの固定の基底型を付け、直後に sizeof の static_assert を置く。
+
+    IDA の enum は宣言に大きさの指定が無ければ 4 バイト。大きさを指定しない C++ の enum は
+    値の範囲に合わせて 1〜2 バイトになり得るので（devkitARM は short enums）、
+    構造体の欄の位置が静かにずれる。そのため全ての enum に基底型を明示する。
+    """
+    if ENUM_ANONYMOUS.search(code):
+        raise ValueError(f"名前の無い enum は大きさを決められません: {owner}")
+    pieces: list[str] = []
+    cursor = 0
+    for match in ENUM_DEFINITION.finditer(code):
+        if match.start() < cursor:
+            continue
+        name, declared, space = match.groups()
+        close = re.compile(r"\}\s*;").search(code, match.end())
+        if not close:
+            raise ValueError(f"enum の終わりがありません: {name}")
+        if declared is None:
+            values = [(sign, int(digits, 0)) for sign, digits in ENUM_VALUE.findall(code[match.end():close.start()])]
+            if any(sign for sign, _ in values):
+                if any(not sign and number > 0x7FFFFFFF for sign, number in values):
+                    raise ValueError(f"負の値と 0x7FFFFFFF を超える値を持つ enum: {name}")
+                base, size = "std::int32_t", 4
+            else:
+                base, size = "std::uint32_t", 4
+        else:
+            declared = declared.strip()
+            if not ENUM_BASE.fullmatch(declared):
+                raise ValueError(f"解釈できない enum の基底型: {name} : {declared}")
+            base, size = declared, int(ENUM_BASE.fullmatch(declared).group(2)) // 8
+        pieces.append(code[cursor:match.start()])
+        pieces.append(f"enum {name} : {base}{space}{{" + code[match.end():close.end()]
+                      + f"\nstatic_assert(sizeof({name}) == {size});")
+        cursor = close.end()
+    pieces.append(code[cursor:])
+    return "".join(pieces)
+
+
 def read_types(folder: Path) -> tuple[dict[str, str], dict[str, str]]:
     definitions: dict[str, str] = {}
     kinds: dict[str, str] = {}
@@ -181,7 +226,7 @@ def read_types(folder: Path) -> tuple[dict[str, str], dict[str, str]]:
             if name in definitions:
                 raise ValueError(f"重複した型: {name}")
             end = matches[index + 1].start() if index + 1 < len(matches) else len(source)
-            body = cpp_syntax(source[match.end():end]).strip()
+            body = fixed_enums(cpp_syntax(source[match.end():end]).strip(), name)
             if not body:
                 raise ValueError(f"空の型: {name}")
             definitions[name] = body
@@ -293,7 +338,8 @@ def generate(repo: Path, config_path: Path | None = None) -> Path:
     if FORBIDDEN.search(result):
         raise ValueError("生成したヘッダーに解析固有の情報が含まれています")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(result, encoding="utf-8")
+    # 改行は OS によらず LF に固定する（Windows の既定の CRLF だと、収録済みの物と全行が食い違う）。
+    destination.write_bytes(result.encode("utf-8"))
     return destination
 
 
