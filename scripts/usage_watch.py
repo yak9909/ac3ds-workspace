@@ -218,6 +218,37 @@ def collect(root=None, *, sessions=None, now=None):
     return update_usage(state, updates)
 
 
+def claude_rate_limit(line):
+    """claude -p の stream-json の 1 行から、5時間枠の実測を読む。(使用率, リセットの epoch 秒) か None。"""
+    if '"rate_limit_event"' not in line:
+        return None
+    try:
+        event = json.loads(line)
+        five_hour = event["rate_limit_info"]["unifiedWindows"]["five_hour"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    used = number(five_hour.get("utilization"))
+    return None if used is None else (round(used * 100, 1), number(five_hour.get("resetsAt")))
+
+
+def record_claude_usage(state, line):
+    """ワーカーの実測を usage.json に残す。statusline はオーケストラが動く時しか更新されないので、見張りと capacity のため。"""
+    found = claude_rate_limit(line)
+    if found is None:
+        return
+    used, reset = found
+
+    def updates(data):
+        claude = data.get("claude")
+        claude = dict(claude) if isinstance(claude, dict) else {}
+        claude.update(five_hour_used_percent=used, updated=int(time.time()))
+        if reset is not None:
+            claude["resets_at"] = reset
+        return {"claude": claude}
+
+    update_usage(state, updates)
+
+
 GUARD_INTERVAL_SEC = 60  # 見張りの間隔（試験では差し替える）
 
 
@@ -238,10 +269,15 @@ class GuardRun:
     used_percent: float | None  # 止めたときの使用率
 
 
-def _drain(stream, chunks):
+def _drain(stream, chunks, on_line=None):
     try:
         for line in iter(stream.readline, ""):
             chunks.append(line)
+            if on_line is not None:
+                try:
+                    on_line(line)
+                except Exception:  # 記録の失敗で出力の読み取りを止めない
+                    pass
     except (OSError, ValueError):
         pass
 
@@ -273,10 +309,11 @@ def kill_tree(proc):
 
 
 def run_with_guard(cmd, *, input_text="", cwd=None, env=None, root=None, provider="codex",
-                   threshold_pct=None, interval=None, usage=None):
+                   threshold_pct=None, interval=None, usage=None, on_line=None):
     """cmd を起動し、終わるまで待つ。interval 秒ごとに provider の5時間枠の使用率を見て、
     閾値以上になったら子プロセスごと止める。閾値は workers.toml の stop_at_used_percent（既定 80）。
-    usage は使用率を返す関数（試験で差し替える。既定は collect で集計する）。戻り値は GuardRun。"""
+    usage は使用率を返す関数（試験で差し替える。既定は collect で集計する）。
+    on_line は標準出力の 1 行ごとに呼ぶ関数（ログを逐次残すなど）。戻り値は GuardRun。"""
     root = root or wslib.workspace_root()
     limit = threshold_pct if threshold_pct is not None else threshold(root)
     interval = GUARD_INTERVAL_SEC if interval is None else interval
@@ -285,7 +322,7 @@ def run_with_guard(cmd, *, input_text="", cwd=None, env=None, root=None, provide
                             stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
                             start_new_session=os.name != "nt")
     out, err = [], []
-    threads = [threading.Thread(target=_drain, args=(proc.stdout, out), daemon=True),
+    threads = [threading.Thread(target=_drain, args=(proc.stdout, out, on_line), daemon=True),
                threading.Thread(target=_drain, args=(proc.stderr, err), daemon=True),
                threading.Thread(target=_feed, args=(proc.stdin, input_text), daemon=True)]
     for t in threads:

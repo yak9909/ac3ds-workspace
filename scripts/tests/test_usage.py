@@ -63,6 +63,44 @@ def test_statusline_fallback_and_preserves_codex(tmp_path):
     assert usage_watch.read_json(state / "usage.json")["codex"]["five_hour_used_percent"] == 23
 
 
+RATE_LINE = json.dumps({"type": "rate_limit_event", "rate_limit_info": {
+    "status": "allowed", "unifiedWindows": {"five_hour": {"utilization": 0.57, "resetsAt": 1793576400},
+                                            "seven_day": {"utilization": 0.08}}}}) + "\n"
+
+
+def test_claude_rate_limit_reads_only_the_five_hour_window():
+    assert usage_watch.claude_rate_limit(RATE_LINE) == (57.0, 1793576400)
+    assert usage_watch.claude_rate_limit('{"type":"assistant"}\n') is None
+    assert usage_watch.claude_rate_limit('{"type":"rate_limit_event"}\n') is None
+    assert usage_watch.claude_rate_limit('"rate_limit_event" 壊れた行\n') is None
+
+
+def test_record_claude_usage_keeps_codex_and_is_read_back(tmp_path):
+    state = tmp_path / "_local" / "state"
+    write_json(state / "usage.json", {"codex": {"five_hour_used_percent": 5}})
+    usage_watch.record_claude_usage(state, '{"type":"assistant"}\n')
+    assert "claude" not in json.loads((state / "usage.json").read_text(encoding="utf-8"))
+    usage_watch.record_claude_usage(state, RATE_LINE)
+    data = json.loads((state / "usage.json").read_text(encoding="utf-8"))
+    assert data["codex"]["five_hour_used_percent"] == 5
+    assert data["claude"]["five_hour_used_percent"] == 57.0 and data["claude"]["resets_at"] == 1793576400
+
+
+def test_run_with_guard_passes_lines_and_survives_callback_errors(tmp_path):
+    seen = []
+
+    def on_line(line):
+        seen.append(line)
+        raise RuntimeError("記録の失敗")
+
+    child = "print('一', flush=True)\nprint('二', flush=True)\n"
+    r = usage_watch.run_with_guard([sys.executable, "-X", "utf8", "-c", child], root=tmp_path, usage=lambda: None,
+                                   interval=1, on_line=on_line,
+                                   env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+    assert r.returncode == 0 and not r.stopped and r.stdout.split() == ["一", "二"]
+    assert [x.strip() for x in seen] == ["一", "二"]
+
+
 def test_reverse_lines_crosses_blocks(tmp_path):
     path = tmp_path / "rollout-big.jsonl"
     lines = [json.dumps({"text": "日本語" * 20000}), '{"type":"token_count"}', "tail"]

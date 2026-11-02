@@ -791,6 +791,157 @@ def test_codex_failure_returns_1(env, monkeypatch, capsys):
     assert tasks(ws)["ac3ds-re#5"]["codex_log"]
 
 
+class FakeClaude:
+    """orch.run_claude の代わり。起動せず、決めた結果を返す。"""
+
+    def __init__(self, out, err="", code=0, stopped=False, used=None, writes_report=None):
+        self.out, self.err, self.code, self.stopped, self.used = out, err, code, stopped, used
+        self.writes_report = writes_report
+        self.calls = []
+
+    def __call__(self, c, cmd, cwd, prompt, log):
+        self.calls.append((list(cmd), Path(cwd), prompt))
+        log.write_text(self.out, encoding="utf-8")
+        if self.writes_report:
+            (Path(cwd) / ".task" / "report.md").write_text(self.writes_report, encoding="utf-8")
+        return orch.usage_watch.GuardRun(self.code, self.out, self.err, self.stopped, self.used)
+
+
+def use_claude(monkeypatch, ws, out, **kw):
+    agents = ws / ".claude" / "agents"
+    if not agents.exists():
+        shutil.copytree(REAL_ROOT / ".claude" / "agents", agents)
+    monkeypatch.setattr(orch, "find_claude", lambda: "claude")
+    fc = FakeClaude(out, **kw)
+    monkeypatch.setattr(orch, "run_claude", fc)
+    return fc
+
+
+def claude_jsonl(*results, is_error=False, subtype="success"):
+    lines = [json.dumps({"type": "system", "subtype": "init", "session_id": "s"})]
+    lines += [json.dumps({"type": "result", "subtype": subtype, "is_error": is_error, "result": m, "duration_api_ms": 60000})
+              for m in results]
+    return "\n".join(lines) + "\n"
+
+
+def test_claude_runs_as_main_session_and_saves_the_last_result(env, capsys, monkeypatch):
+    ws, fake, _ = env
+    assert run("dispatch", "5", "--worker", "haiku-5.5", "--effort", "xhigh", *precheck_args(ws)) == 0
+    wt = Path(tasks(ws)["ac3ds-re#5"]["worktree"])
+    fc = use_claude(monkeypatch, ws, claude_jsonl("試験を待ちます", "最後の報告です"))
+    assert run("claude", "5") == 0
+    cmd, cwd, prompt = fc.calls[0]
+    assert cwd == wt and cmd[:2] == ["claude", "-p"]
+    assert cmd[cmd.index("--model") + 1] == "claude-haiku-5-5" and cmd[cmd.index("--effort") + 1] == "xhigh"
+    assert cmd[cmd.index("--output-format") + 1] == "stream-json" and "--verbose" in cmd
+    # サブエージェントを持たせず、IDA を使わない作業では MCP を起動しない。
+    denied = cmd[cmd.index("--disallowedTools") + 1].split(",")
+    assert "Agent" in denied and "Task" in denied and "Monitor" in denied
+    assert "--strict-mcp-config" in cmd
+    # 親の CLAUDE.md のオーケストラの段落を自分の事と読まない。定義の本文も渡す（front matter は渡さない）。
+    system = cmd[cmd.index("--append-system-prompt") + 1]
+    assert "あなたはオーケストラではありません" in system and "道具づくりのワーカー" in system and "name: tooling" not in system
+    t = tasks(ws)["ac3ds-re#5"]
+    assert cmd[cmd.index("--session-id") + 1] == t["claude_session"]
+    assert prompt == (ws / "_local" / "orchestrator" / "dispatch" / "5.md").read_text(encoding="utf-8")
+    assert t["claude_finished_at"] and Path(t["claude_log"]) == ws / "_local" / "logs" / "claude_ac3ds-re_5_1.jsonl"
+    assert "最後の報告です" in capsys.readouterr().out
+    assert (wt / ".task" / "report.md").read_text(encoding="utf-8") == \
+        "（ワーカーの最終の返答をオーケストラが保存した）\n最後の報告です\n"
+
+
+def test_claude_resume_uses_the_same_session_and_appends_the_report(env, monkeypatch):
+    ws, fake, _ = env
+    run("dispatch", "5", "--worker", "haiku-5.5", *precheck_args(ws))
+    wt = Path(tasks(ws)["ac3ds-re#5"]["worktree"])
+    use_claude(monkeypatch, ws, claude_jsonl("一回目"))
+    assert run("claude", "5") == 0
+    session = tasks(ws)["ac3ds-re#5"]["claude_session"]
+    message = ws / "_local" / "followup.md"
+    message.write_text("直してください\n", encoding="utf-8")
+    fc = use_claude(monkeypatch, ws, claude_jsonl("二回目"))
+    assert run("claude", "5", "--resume", "--message-file", str(message)) == 0
+    cmd, _, prompt = fc.calls[0]
+    assert cmd[cmd.index("--resume") + 1] == session and "--session-id" not in cmd and prompt == "直してください\n"
+    assert tasks(ws)["ac3ds-re#5"]["claude_session"] == session
+    text = (wt / ".task" / "report.md").read_text(encoding="utf-8")
+    assert "一回目" in text and "続きの実行の報告" in text and text.rstrip().endswith("二回目")
+    assert (ws / "_local" / "logs" / "claude_ac3ds-re_5_2.jsonl").is_file()
+
+
+def test_claude_keeps_the_report_the_worker_wrote(env, monkeypatch):
+    ws, fake, _ = env
+    run("dispatch", "5", "--worker", "haiku-5.5", *precheck_args(ws))
+    wt = Path(tasks(ws)["ac3ds-re#5"]["worktree"])
+    use_claude(monkeypatch, ws, claude_jsonl("完了しました"), writes_report="自分で書いた報告\n")
+    assert run("claude", "5") == 0
+    assert (wt / ".task" / "report.md").read_text(encoding="utf-8") == "自分で書いた報告\n"
+
+
+def test_claude_stopped_by_guard_is_resumable(env, monkeypatch, capsys):
+    ws, fake, _ = env
+    run("dispatch", "5", "--worker", "haiku-5.5", *precheck_args(ws))
+    wt = Path(tasks(ws)["ac3ds-re#5"]["worktree"])
+    use_claude(monkeypatch, ws, "", stopped=True, used=85.0, code=1)
+    assert run("claude", "5") == orch.CODEX_STOPPED_RC
+    assert "続きは orch.py claude --resume" in capsys.readouterr().out
+    t = tasks(ws)["ac3ds-re#5"]
+    assert t["claude_stopped_at_usage"] == 85.0 and t["claude_session"] and t["state"] == "dispatched"
+    assert not (wt / ".task" / "report.md").exists()
+
+
+def test_claude_error_result_is_not_saved_as_report(env, monkeypatch, capsys):
+    ws, fake, _ = env
+    run("dispatch", "5", "--worker", "haiku-5.5", *precheck_args(ws))
+    wt = Path(tasks(ws)["ac3ds-re#5"]["worktree"])
+    use_claude(monkeypatch, ws, claude_jsonl("利用枠の上限です", is_error=True, subtype="error_during_execution"))
+    assert run("claude", "5") == 1
+    assert "error_during_execution" in capsys.readouterr().out
+    assert not (wt / ".task" / "report.md").exists()
+
+
+def test_claude_refused_over_limit_for_codex_worker_and_without_session(env, monkeypatch, capsys):
+    ws, fake, _ = env
+    run("dispatch", "5", "--worker", "gpt-6-sol", *precheck_args(ws))
+    fc = use_claude(monkeypatch, ws, claude_jsonl("x"))
+    assert run("claude", "5") == 1  # Codex のワーカーには使わない
+    assert not fc.calls
+    run("reject", "5", "--reason", "試験")
+    run("dispatch", "5", "--worker", "haiku-5.5", *precheck_args(ws))
+    message = ws / "_local" / "followup.md"
+    message.write_text("続き\n", encoding="utf-8")
+    assert run("claude", "5", "--resume", "--message-file", str(message)) == 1  # 続ける相手が無い
+    assert run("claude", "5", "--resume") == 1  # 伝える事が無い
+    monkeypatch.setattr(orch.capacity, "read_provider_usage", lambda *_: {"five_hour_used_percent": 85})
+    assert run("claude", "5") == 1  # 上限以上では起動しない
+    assert not fc.calls
+    assert "85" in capsys.readouterr().err
+
+
+def test_claude_dry_run_prints_only_and_idb_task_keeps_mcp(env, monkeypatch, capsys):
+    ws, fake, _ = env
+    run("dispatch", "5", "--worker", "sonnet-5.5", "--idb", *precheck_args(ws))
+    before = tasks(ws)["ac3ds-re#5"]
+    fc = use_claude(monkeypatch, ws, claude_jsonl("x"))
+    assert run("claude", "5", "--dry-run", "--model", "claude-opus-5-5", "--effort", "high") == 0
+    out = capsys.readouterr().out
+    assert "claude-opus-5-5" in out and "--strict-mcp-config" not in out
+    assert not fc.calls and tasks(ws)["ac3ds-re#5"] == before
+
+
+def test_claude_env_drops_the_parent_session(env, monkeypatch):
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "cli")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "x")
+    child = orch.claude_env(orch.Ctx())
+    assert "CLAUDECODE" not in child and "CLAUDE_CODE_ENTRYPOINT" not in child and child["CLAUDE_CONFIG_DIR"] == "x"
+
+
+def test_last_claude_result_takes_the_last():
+    assert orch.last_claude_result(claude_jsonl("一", "二"))["result"] == "二"
+    assert orch.last_claude_result('{"type":"assistant"}\nnot json\n') is None
+
+
 def test_codex_refused_for_claude_worker_or_inactive_task(env, monkeypatch):
     ws, fake, _ = env
     dispatch(env)  # sonnet-5.5（claude）

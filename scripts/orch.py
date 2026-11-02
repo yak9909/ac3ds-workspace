@@ -20,6 +20,7 @@ import subprocess
 import sys
 import time
 import tomllib
+import uuid
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
@@ -597,7 +598,8 @@ def stats_rows(tasks):
             if value and (key.endswith("_violation") or key == "violations"):
                 row["violations"][key] = row["violations"].get(key, 0) + 1
         start = capacity.instant(t.get("dispatched_at"))
-        end = capacity.instant(t.get("accepted_at") or t.get("rejected_at") or t.get("codex_finished_at"))
+        end = capacity.instant(t.get("accepted_at") or t.get("rejected_at") or t.get("codex_finished_at")
+                               or t.get("claude_finished_at"))
         if start and end and end >= start:
             row["duration_hours"].append((end - start).total_seconds() / 3600)
     return rows
@@ -1281,12 +1283,12 @@ def git_launch_violation(before: dict, after: dict) -> str:
                     for name in before if before[name] != after[name])
 
 
-def next_log(c: Ctx, repo: str, n) -> Path:
+def next_log(c: Ctx, repo: str, n, kind: str = "codex") -> Path:
     d = c.data / "logs"
     d.mkdir(parents=True, exist_ok=True)
-    pat = re.compile(r"codex_%s_%s_(\d+)\.jsonl$" % (re.escape(repo), n))
+    pat = re.compile(r"%s_%s_%s_(\d+)\.jsonl$" % (kind, re.escape(repo), n))
     nums = [int(m.group(1)) for p in d.iterdir() if (m := pat.match(p.name))]
-    return d / ("codex_%s_%s_%d.jsonl" % (repo, n, max(nums, default=0) + 1))
+    return d / ("%s_%s_%s_%d.jsonl" % (kind, repo, n, max(nums, default=0) + 1))
 
 
 def _dicts(o):
@@ -1422,6 +1424,189 @@ def cmd_codex(a) -> int:
         except OrchError as e:
             print("エラー: 報告を保存できない: %s" % e)
             rc = 1
+    return rc
+
+
+# ---------- claude ----------
+# サブエージェントでなく、CLI のメインのセッションとしてワーカーを起動する（Agent ツールの間だけ遅いため。2026-11-02）。
+# ワーカーに持たせないツール: サブエージェント・他のセッションへの連絡・予約・作業ツリーの切り替え。
+# Monitor は合う行のたびにワーカーを起こして利用枠を使うので、バックグラウンドの完了の知らせだけを待たせる。
+CLAUDE_DENIED_TOOLS = ("Agent", "Task", "ListAgents", "SendMessage", "SendToProject", "SendToProjectContext", "Monitor",
+                       "CronCreate", "CronDelete", "CronList", "ScheduleWakeup", "RemoteTrigger", "PushNotification",
+                       "EnterWorktree", "ExitWorktree", "DesignSync")
+# 作業ツリーの親の CLAUDE.md の「メインのセッションならオーケストラ」を、ワーカーが自分の事と読まないようにする。
+CLAUDE_WORKER_ROLE = """このセッションは、オーケストラが CLI から起動したワーカーです。あなたはオーケストラではありません。
+CLAUDE.md の「メインのセッションなら、あなたはオーケストラです」と、スキル orchestrate・dispatch・evaluate・finalize・wrapup は、このセッションには当てはまりません。依頼文のとおりに、自分で実装・解析をしてください。AGENTS.md の「ワーカーとして呼ばれた場合」の規則に従ってください。
+長くかかる試験やビルドは run_in_background で起動し、終わるまでターンを終えて待ってください。終わると完了の知らせで続きが始まります。最後の返答を、オーケストラが報告として受け取ります。"""
+
+
+def find_claude() -> str:
+    exe = shutil.which("claude")
+    if not exe:
+        raise OrchError("claude が見つからない（PATH に無い）")
+    return exe
+
+
+def claude_model(worker: str) -> str:
+    """workers.toml のワーカーの名前（haiku-5.5）からモデルの ID（claude-haiku-5-5）を作る。"""
+    return "claude-" + worker.replace(".", "-")
+
+
+def claude_system_prompt(c: Ctx, agent: str) -> str:
+    """ワーカーの定義（.claude/agents/<agent>.md の本文）に、役割の説明を足す。"""
+    path = c.root / ".claude" / "agents" / (agent + ".md")
+    if not path.is_file():
+        raise OrchError("ワーカーの定義が無い: %s" % path)
+    text = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+    body = text.split("---\n", 2)[-1] if text.startswith("---\n") else text
+    return CLAUDE_WORKER_ROLE + "\n\n" + body.strip()
+
+
+def claude_cmd(exe: str, model: str, effort: str, system_prompt: str, session: str, resume: bool, use_mcp: bool) -> list[str]:
+    cmd = [exe, "-p", "--model", model, "--effort", effort, "--output-format", "stream-json", "--verbose",
+           "--permission-mode", "bypassPermissions", "--disallowedTools", ",".join(CLAUDE_DENIED_TOOLS),
+           "--append-system-prompt", system_prompt]
+    cmd += ["--resume", session] if resume else ["--session-id", session]
+    if not use_mcp:
+        cmd.append("--strict-mcp-config")  # IDA を使わない作業では MCP のサーバーを起動しない
+    return cmd
+
+
+def claude_env(c: Ctx) -> dict:
+    """ワーカー用の環境変数。親のセッションの CLAUDE* を残すと、入れ子の起動として扱われる。"""
+    return {k: v for k, v in child_env(c).items() if not k.startswith("CLAUDE") or k == "CLAUDE_CONFIG_DIR"}
+
+
+def run_claude(c: Ctx, cmd: list[str], cwd: Path, prompt: str, log: Path) -> usage_watch.GuardRun:
+    """claude を起動し、終わるまで待つ。ログは逐次書き、利用枠の実測は usage.json へ残す（見張りはそれを読む）。
+    閾値以上なら止める。試験ではこの関数を差し替える。"""
+    with log.open("w", encoding="utf-8", newline="\n") as f:
+        def on_line(line):
+            f.write(line)
+            f.flush()
+            usage_watch.record_claude_usage(c.state, line)
+        return usage_watch.run_with_guard(cmd, input_text=prompt, cwd=str(cwd), env=claude_env(c), root=c.root,
+                                          provider="claude", on_line=on_line)
+
+
+def last_claude_result(jsonl: str) -> dict | None:
+    """stream-json の最後の result。バックグラウンドの完了で続きが走ると result は複数になる。"""
+    found = None
+    for line in jsonl.splitlines():
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and obj.get("type") == "result":
+            found = obj
+    return found
+
+
+def append_report(t: dict, text: str) -> Path:
+    """続きの実行の報告を、前の報告の後ろに足す。"""
+    body = text.strip()
+    if not body:
+        raise OrchError("報告が空")
+    outgoing(body)
+    f = Path(t["worktree"]) / ".task" / "report.md"
+    with f.open("a", encoding="utf-8", newline="\n") as out:
+        out.write("\n---\n\n## 続きの実行の報告（%s）\n\n%s\n" % (now(), body))
+    print("報告に追記: %s" % f)
+    return f
+
+
+def cmd_claude(a) -> int:
+    c = Ctx()
+    need_repo(c, a.repo)
+    t = get_task(c, a.repo, a.issue)
+    require_unpaused(t)
+    key = tkey(a.repo, a.issue)
+    if t.get("provider") != "claude":
+        raise OrchError("台帳の provider が claude でない（%s）" % t.get("provider"))
+    require_active(t)
+    model = a.model or claude_model(t.get("worker") or "")
+    effort = a.effort or t.get("effort")
+    if not effort:
+        raise OrchError("effort が台帳に無い。--effort で指定する")
+    if a.resume and not a.message_file:
+        raise OrchError("--resume には --message-file が要る")
+    if a.message_file and not a.resume:
+        raise OrchError("--message-file は --resume と一緒に指定する")
+    if a.resume:
+        session = t.get("claude_session")
+        if not session:
+            raise OrchError("続きに使うセッションが台帳に無い")
+        prompt_file = a.message_file
+        prompt = read_source(prompt_file)
+    else:
+        prompt_file = task_file(c, "dispatch", a.repo, a.issue)
+        if not prompt_file.is_file():
+            raise OrchError("依頼文が無い: %s" % prompt_file)
+        session = str(uuid.uuid4())
+        prompt = prompt_file.read_text(encoding="utf-8")
+    wt = Path(t["worktree"])
+    if not wt.is_dir():
+        raise OrchError("作業ツリーが無い: %s" % wt)
+    worker = c.workers.get("workers", {}).get(t.get("worker")) or {}
+    system_prompt = claude_system_prompt(c, worker.get("agent") or "tooling")
+    cmd = claude_cmd(find_claude(), model, effort, system_prompt, session, a.resume, bool(t.get("idb")))
+    if a.dry_run:
+        print("dry-run: 実行しない。コマンド:")
+        print(subprocess.list2cmdline(cmd))
+        print("依頼文（標準入力）: %s" % prompt_file)
+        return 0
+    usage_watch.collect(c.root)
+    limit = c.workers.get("limits", {}).get("stop_at_used_percent", 80)
+    used = capacity.read_provider_usage(c.state, "claude").get("five_hour_used_percent")
+    if used is not None and used >= limit:
+        raise OrchError("5時間枠の使用率 %s%% が上限 %s%% 以上なので起動しない" % (used, limit))
+    log = next_log(c, a.repo, a.issue, "claude")
+    update_task(c, key, claude_session=session, claude_log=str(log), claude_started_at=now())
+    report = wt / ".task" / "report.md"
+    report_before = report.read_bytes() if report.exists() else None
+    git_before = git_launch_state(c, wt)
+    started = time.time()
+    try:
+        r = run_claude(c, cmd, wt, prompt, log)
+    finally:
+        violation = git_launch_violation(git_before, git_launch_state(c, wt))
+        if violation:
+            print("警告: ワーカーが Git に書き込んだ: %s" % violation)
+            update_task(c, key, git_violation=violation)
+    update_task(c, key, claude_finished_at=now())
+    if r.stopped:
+        update_task(c, key, claude_stopped_at_usage=r.used_percent, claude_stopped_at=now())
+        print("利用枠の %g%% でワーカーを止めた。続きは orch.py claude --resume で頼む" % r.used_percent)
+        print("ログ: %s" % log)
+        return CODEX_STOPPED_RC
+    result = last_claude_result(r.stdout)
+    print("claude の終了コード: %d（モデル %s、effort %s、%.1f 分）" % (r.returncode, model, effort, (time.time() - started) / 60))
+    print("ログ: %s" % log)
+    if r.returncode != 0 and r.stderr.strip():
+        print("== stderr の末尾 ==")
+        print("\n".join(r.stderr.strip().splitlines()[-20:]))
+    if result is None:
+        print("警告: result が無く、報告を保存できない")
+        return 1
+    print("API の時間 %.1f 分、セッション %s" % ((result.get("duration_api_ms") or 0) / 60000, session))
+    message = result.get("result") if isinstance(result.get("result"), str) else ""
+    print("== 最後の返答 ==")
+    print(message)
+    rc = 1 if r.returncode != 0 or result.get("is_error") else 0
+    if rc:
+        print("エラーで終わった（%s）。報告は保存しない" % result.get("subtype"))
+        return rc
+    after = report.read_bytes() if report.exists() else None
+    try:
+        if after != report_before:
+            print("報告: ワーカーが %s を書いたので、そのまま使う" % report)
+        elif report_before is not None:
+            append_report(t, message)
+        else:
+            save_report(t, message)
+    except OrchError as e:
+        print("エラー: 報告を保存できない: %s" % e)
+        rc = 1
     return rc
 
 
@@ -1987,6 +2172,12 @@ def main(argv=None) -> int:
     s.add_argument("issue", type=int)
     s.add_argument("--from", dest="src", required=True)
     s = add("codex", cmd_codex, dry=True)
+    s.add_argument("issue", type=int)
+    s.add_argument("--model")
+    s.add_argument("--effort")
+    s.add_argument("--resume", action="store_true")
+    s.add_argument("--message-file")
+    s = add("claude", cmd_claude, dry=True)
     s.add_argument("issue", type=int)
     s.add_argument("--model")
     s.add_argument("--effort")
