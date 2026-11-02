@@ -1434,9 +1434,10 @@ def cmd_codex(a) -> int:
 CLAUDE_DENIED_TOOLS = ("Agent", "Task", "ListAgents", "SendMessage", "SendToProject", "SendToProjectContext", "Monitor",
                        "CronCreate", "CronDelete", "CronList", "ScheduleWakeup", "RemoteTrigger", "PushNotification",
                        "EnterWorktree", "ExitWorktree", "DesignSync")
+REVIEW_WORKER = "opus-5.5"  # 深い検証の役のモデル（.claude/agents/reviewer.md の model と同じ）
 # 作業ツリーの親の CLAUDE.md の「メインのセッションならオーケストラ」を、ワーカーが自分の事と読まないようにする。
 CLAUDE_WORKER_ROLE = """このセッションは、オーケストラが CLI から起動したワーカーです。あなたはオーケストラではありません。
-CLAUDE.md の「メインのセッションなら、あなたはオーケストラです」と、スキル orchestrate・dispatch・evaluate・finalize・wrapup は、このセッションには当てはまりません。依頼文のとおりに、自分で実装・解析をしてください。AGENTS.md の「ワーカーとして呼ばれた場合」の規則に従ってください。
+CLAUDE.md の「メインのセッションなら、あなたはオーケストラです」と、スキル orchestrate・dispatch・evaluate・finalize・wrapup は、このセッションには当てはまりません。依頼文のとおりに、自分で作業をしてください。AGENTS.md の「ワーカーとして呼ばれた場合」の規則に従ってください。
 長くかかる試験やビルドは run_in_background で起動し、終わるまでターンを終えて待ってください。終わると完了の知らせで続きが始まります。最後の返答を、オーケストラが報告として受け取ります。"""
 
 
@@ -1502,6 +1503,35 @@ def last_claude_result(jsonl: str) -> dict | None:
     return found
 
 
+def refuse_over_claude_limit(c: Ctx) -> None:
+    usage_watch.collect(c.root)
+    limit = c.workers.get("limits", {}).get("stop_at_used_percent", 80)
+    used = capacity.read_provider_usage(c.state, "claude").get("five_hour_used_percent")
+    if used is not None and used >= limit:
+        raise OrchError("5時間枠の使用率 %s%% が上限 %s%% 以上なので起動しない" % (used, limit))
+
+
+def show_claude_run(r: usage_watch.GuardRun, model: str, effort: str, started: float, log: Path, session: str) -> tuple[int, str]:
+    """止められずに終わった実行の結果を表示し、（終了コード、最後の返答）を返す。0 でなければ報告を保存しない。"""
+    result = last_claude_result(r.stdout)
+    print("claude の終了コード: %d（モデル %s、effort %s、%.1f 分）" % (r.returncode, model, effort, (time.time() - started) / 60))
+    print("ログ: %s" % log)
+    if r.returncode != 0 and r.stderr.strip():
+        print("== stderr の末尾 ==")
+        print("\n".join(r.stderr.strip().splitlines()[-20:]))
+    if result is None:
+        print("警告: result が無く、報告を保存できない")
+        return 1, ""
+    print("API の時間 %.1f 分、セッション %s" % ((result.get("duration_api_ms") or 0) / 60000, session))
+    message = result.get("result") if isinstance(result.get("result"), str) else ""
+    print("== 最後の返答 ==")
+    print(message)
+    rc = 1 if r.returncode != 0 or result.get("is_error") else 0
+    if rc:
+        print("エラーで終わった（%s）。報告は保存しない" % result.get("subtype"))
+    return rc, message
+
+
 def append_report(t: dict, text: str) -> Path:
     """続きの実行の報告を、前の報告の後ろに足す。"""
     body = text.strip()
@@ -1555,11 +1585,7 @@ def cmd_claude(a) -> int:
         print(subprocess.list2cmdline(cmd))
         print("依頼文（標準入力）: %s" % prompt_file)
         return 0
-    usage_watch.collect(c.root)
-    limit = c.workers.get("limits", {}).get("stop_at_used_percent", 80)
-    used = capacity.read_provider_usage(c.state, "claude").get("five_hour_used_percent")
-    if used is not None and used >= limit:
-        raise OrchError("5時間枠の使用率 %s%% が上限 %s%% 以上なので起動しない" % (used, limit))
+    refuse_over_claude_limit(c)
     log = next_log(c, a.repo, a.issue, "claude")
     update_task(c, key, claude_session=session, claude_log=str(log), claude_started_at=now())
     report = wt / ".task" / "report.md"
@@ -1579,22 +1605,8 @@ def cmd_claude(a) -> int:
         print("利用枠の %g%% でワーカーを止めた。続きは orch.py claude --resume で頼む" % r.used_percent)
         print("ログ: %s" % log)
         return CODEX_STOPPED_RC
-    result = last_claude_result(r.stdout)
-    print("claude の終了コード: %d（モデル %s、effort %s、%.1f 分）" % (r.returncode, model, effort, (time.time() - started) / 60))
-    print("ログ: %s" % log)
-    if r.returncode != 0 and r.stderr.strip():
-        print("== stderr の末尾 ==")
-        print("\n".join(r.stderr.strip().splitlines()[-20:]))
-    if result is None:
-        print("警告: result が無く、報告を保存できない")
-        return 1
-    print("API の時間 %.1f 分、セッション %s" % ((result.get("duration_api_ms") or 0) / 60000, session))
-    message = result.get("result") if isinstance(result.get("result"), str) else ""
-    print("== 最後の返答 ==")
-    print(message)
-    rc = 1 if r.returncode != 0 or result.get("is_error") else 0
+    rc, message = show_claude_run(r, model, effort, started, log, session)
     if rc:
-        print("エラーで終わった（%s）。報告は保存しない" % result.get("subtype"))
         return rc
     after = report.read_bytes() if report.exists() else None
     try:
@@ -1608,6 +1620,64 @@ def cmd_claude(a) -> int:
         print("エラー: 報告を保存できない: %s" % e)
         rc = 1
     return rc
+
+
+def cmd_review(a) -> int:
+    """深い検証の役を CLI で起動する。ワーカーのセッションと報告には触らず、報告は orchestrator/review/ に残す。"""
+    c = Ctx()
+    need_repo(c, a.repo)
+    t = get_task(c, a.repo, a.issue)
+    require_active(t)
+    key = tkey(a.repo, a.issue)
+    session = t.get("review_session") if a.resume else str(uuid.uuid4())
+    if not session:
+        raise OrchError("続きに使うセッションが台帳に無い")
+    prompt = read_source(a.message_file)
+    wt = Path(t["worktree"])
+    if not wt.is_dir():
+        raise OrchError("作業ツリーが無い: %s" % wt)
+    model = a.model or claude_model(REVIEW_WORKER)
+    cmd = claude_cmd(find_claude(), model, a.effort, claude_system_prompt(c, "reviewer"), session, a.resume, bool(t.get("idb")))
+    if a.dry_run:
+        print("dry-run: 実行しない。コマンド:")
+        print(subprocess.list2cmdline(cmd))
+        print("依頼文（標準入力）: %s" % a.message_file)
+        return 0
+    refuse_over_claude_limit(c)
+    log = next_log(c, a.repo, a.issue, "review")
+    update_task(c, key, review_session=session, review_log=str(log), review_started_at=now())
+    git_before = git_launch_state(c, wt)
+    status_before = git(c, wt, "status", "--porcelain")
+    started = time.time()
+    try:
+        r = run_claude(c, cmd, wt, prompt, log)
+    finally:
+        violation = git_launch_violation(git_before, git_launch_state(c, wt))
+        if violation:
+            print("警告: 検証役が Git に書き込んだ: %s" % violation)
+            update_task(c, key, git_violation=violation)
+        if git(c, wt, "status", "--porcelain") != status_before:
+            print("警告: 検証役が作業ツリーのファイルを変えた。採点の前に確かめる")
+    update_task(c, key, review_finished_at=now())
+    if r.stopped:
+        update_task(c, key, review_stopped_at_usage=r.used_percent)
+        print("利用枠の %g%% で検証役を止めた。続きは orch.py review --resume で頼む" % r.used_percent)
+        print("ログ: %s" % log)
+        return CODEX_STOPPED_RC
+    rc, message = show_claude_run(r, model, a.effort, started, log, session)
+    if rc:
+        return rc
+    body = message.strip()
+    if not body:
+        print("警告: 最後の返答が空で、報告を保存できない")
+        return 1
+    report = task_file(c, "review", a.repo, a.issue)
+    report.parent.mkdir(parents=True, exist_ok=True)
+    if a.resume and report.is_file():
+        body = report.read_text(encoding="utf-8").rstrip() + "\n\n---\n\n## 続きの実行の報告（%s）\n\n" % now() + body
+    report.write_text(body + "\n", encoding="utf-8", newline="\n")
+    print("報告: %s（orch.py accept --reviewed に渡す）" % report)
+    return 0
 
 
 # ---------- stamp ----------
@@ -2183,6 +2253,12 @@ def main(argv=None) -> int:
     s.add_argument("--effort")
     s.add_argument("--resume", action="store_true")
     s.add_argument("--message-file")
+    s = add("review", cmd_review, dry=True)
+    s.add_argument("issue", type=int)
+    s.add_argument("--model")
+    s.add_argument("--effort", required=True)
+    s.add_argument("--resume", action="store_true")
+    s.add_argument("--message-file", required=True)
     s = add("stamp", cmd_stamp)
     s.add_argument("issue", type=int)
     s.add_argument("--allow-outside", action="store_true")

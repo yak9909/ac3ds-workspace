@@ -918,6 +918,83 @@ def test_claude_refused_over_limit_for_codex_worker_and_without_session(env, mon
     assert "85" in capsys.readouterr().err
 
 
+def review_message(ws):
+    message = ws / "_local" / "review-request.md"
+    message.write_text("記録を確かめてください\n", encoding="utf-8")
+    return str(message)
+
+
+def test_review_starts_a_new_session_and_leaves_the_worker_alone(env, monkeypatch, capsys):
+    ws, fake, _ = env
+    run("dispatch", "5", "--worker", "haiku-5.5", *precheck_args(ws))
+    wt = Path(tasks(ws)["ac3ds-re#5"]["worktree"])
+    use_claude(monkeypatch, ws, claude_jsonl("ワーカーの報告"))
+    assert run("claude", "5") == 0
+    worker_session = tasks(ws)["ac3ds-re#5"]["claude_session"]
+    report_before = (wt / ".task" / "report.md").read_bytes()
+    fc = use_claude(monkeypatch, ws, claude_jsonl("判定: 確認"))
+    assert run("review", "5", "--effort", "high", "--message-file", review_message(ws)) == 0
+    cmd, cwd, prompt = fc.calls[0]
+    assert cwd == wt and prompt == "記録を確かめてください\n"
+    assert cmd[cmd.index("--model") + 1] == "claude-opus-5-5" and cmd[cmd.index("--effort") + 1] == "high"
+    system = cmd[cmd.index("--append-system-prompt") + 1]
+    assert "あなたはオーケストラではありません" in system and "あなたは検証役です" in system
+    assert "Agent" in cmd[cmd.index("--disallowedTools") + 1].split(",")
+    t = tasks(ws)["ac3ds-re#5"]
+    assert t["claude_session"] == worker_session and t["review_session"] == cmd[cmd.index("--session-id") + 1]
+    assert t["review_session"] != worker_session
+    assert Path(t["review_log"]) == ws / "_local" / "logs" / "review_ac3ds-re_5_1.jsonl" and t["review_finished_at"]
+    assert (wt / ".task" / "report.md").read_bytes() == report_before
+    assert (ws / "_local" / "orchestrator" / "review" / "5.md").read_text(encoding="utf-8") == "判定: 確認\n"
+    assert "accept --reviewed" in capsys.readouterr().out
+
+
+def test_review_resume_uses_the_same_session_and_keeps_the_first_report(env, monkeypatch):
+    ws, fake, _ = env
+    run("dispatch", "5", "--worker", "haiku-5.5", *precheck_args(ws))
+    fc = use_claude(monkeypatch, ws, claude_jsonl("x"))
+    assert run("review", "5", "--effort", "high", "--resume", "--message-file", review_message(ws)) == 1  # 続ける相手が無い
+    assert not fc.calls
+    use_claude(monkeypatch, ws, claude_jsonl("判定: 一部確認"))
+    assert run("review", "5", "--effort", "high", "--message-file", review_message(ws)) == 0
+    session = tasks(ws)["ac3ds-re#5"]["review_session"]
+    fc = use_claude(monkeypatch, ws, claude_jsonl("判定: 確認"))
+    assert run("review", "5", "--effort", "high", "--resume", "--message-file", review_message(ws)) == 0
+    cmd = fc.calls[0][0]
+    assert cmd[cmd.index("--resume") + 1] == session and "--session-id" not in cmd
+    text = (ws / "_local" / "orchestrator" / "review" / "5.md").read_text(encoding="utf-8")
+    assert "判定: 一部確認" in text and "続きの実行の報告" in text and text.rstrip().endswith("判定: 確認")
+
+
+def test_review_stopped_error_and_limit_save_no_report(env, monkeypatch, capsys):
+    ws, fake, _ = env
+    run("dispatch", "5", "--worker", "gpt-6-sol", *precheck_args(ws))  # Codex のワーカーの結果も検証できる
+    report = ws / "_local" / "orchestrator" / "review" / "5.md"
+    use_claude(monkeypatch, ws, "", stopped=True, used=85.0, code=1)
+    assert run("review", "5", "--effort", "high", "--message-file", review_message(ws)) == orch.CODEX_STOPPED_RC
+    assert "続きは orch.py review --resume" in capsys.readouterr().out and not report.exists()
+    assert tasks(ws)["ac3ds-re#5"]["review_stopped_at_usage"] == 85.0
+    use_claude(monkeypatch, ws, claude_jsonl("上限です", is_error=True, subtype="error_during_execution"))
+    assert run("review", "5", "--effort", "high", "--message-file", review_message(ws)) == 1 and not report.exists()
+    fc = use_claude(monkeypatch, ws, claude_jsonl("x"))
+    monkeypatch.setattr(orch.capacity, "read_provider_usage", lambda *_: {"five_hour_used_percent": 85})
+    assert run("review", "5", "--effort", "high", "--message-file", review_message(ws)) == 1 and not fc.calls
+    assert "85" in capsys.readouterr().err
+
+
+def test_review_warns_when_files_change_and_dry_run_prints_only(env, monkeypatch, capsys):
+    ws, fake, _ = env
+    run("dispatch", "5", "--worker", "haiku-5.5", "--idb", *precheck_args(ws))
+    before = tasks(ws)["ac3ds-re#5"]
+    fc = use_claude(monkeypatch, ws, claude_jsonl("判定: 確認"), writes_report="書き換えた\n")
+    assert run("review", "5", "--dry-run", "--effort", "medium", "--message-file", review_message(ws)) == 0
+    out = capsys.readouterr().out
+    assert "claude-opus-5-5" in out and "--strict-mcp-config" not in out  # IDB の作業では MCP を残す
+    assert not fc.calls and tasks(ws)["ac3ds-re#5"] == before
+    assert run("review", "5", "--effort", "medium", "--message-file", review_message(ws)) == 0
+    assert "作業ツリーのファイルを変えた" in capsys.readouterr().out
+
+
 def test_claude_dry_run_prints_only_and_idb_task_keeps_mcp(env, monkeypatch, capsys):
     ws, fake, _ = env
     run("dispatch", "5", "--worker", "sonnet-5.5", "--idb", *precheck_args(ws))
