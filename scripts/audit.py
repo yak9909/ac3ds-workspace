@@ -19,7 +19,7 @@ import wslib  # noqa: E402
 # .gitignore のホワイトリストと同じ一覧
 ALLOWED_TOP = [".gitattributes", ".github/", ".claude/agents/", ".claude/settings.json", "README.md",
                "AGENTS.md", "CLAUDE.md", "LICENSE", "workspace.toml", "workers.toml", "skills/",
-               "templates/", "scripts/"]
+               "templates/", "scripts/", "docs/"]
 ALWAYS_TOP = {".gitignore", ".git"}
 # 道具が作る・出る物（Git の管理外）。散乱とは見なさない
 GENERATED_TOP = {".agents", ".pytest_cache", "__pycache__"}
