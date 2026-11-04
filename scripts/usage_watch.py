@@ -232,7 +232,7 @@ def claude_rate_limit(line):
 
 
 def record_claude_usage(state, line):
-    """ワーカーの実測を usage.json に残す。statusline はオーケストラが動く時しか更新されないので、見張りと capacity のため。"""
+    """ワーカーの実測を usage.json に残す。statusline は司令塔が動く時しか更新されないので、見張りと capacity のため。"""
     found = claude_rate_limit(line)
     if found is None:
         return

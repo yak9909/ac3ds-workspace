@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""オーケストラの道具。台帳（_local/state/tasks.json）を軸に、Issue・依頼・Codex の起動・報告の保存・保存・採点用の要約・取り込み・却下を行う。
+"""司令塔の道具。台帳（_local/state/tasks.json）を軸に、Issue・依頼・Codex の起動・報告の保存・保存・採点用の要約・取り込み・却下を行う。
 
 GitHub への操作は gh_run() の1か所に集め、試験で差し替える。
 """
@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -61,8 +62,6 @@ LABELS = (
     [(s, "1d76db", "スコープ") for s in SCOPES]
     + [(k, "5319e7", "種類") for k in KINDS]
     + [(d, "0e8a16", "難易度") for d in DIFFS]
-    + [("blocked", "b60205", "止まっている"), ("needs-user", "d93f0b", "利用者の判断が要る"),
-       ("spot-check", "fbca04", "抜き取り確認"), ("rule-proposal", "c5def5", "規則の提案")]
 )
 
 
@@ -483,14 +482,6 @@ def mirror(c: Ctx) -> None:
 
 
 # ---------- start / status ----------
-def periodic(c: Ctx) -> dict:
-    p = c.state / "periodic.json"
-    try:
-        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
-    except ValueError:
-        return {}
-
-
 def export_state(c: Ctx) -> dict:
     p = c.state / "export.json"
     try:
@@ -564,6 +555,11 @@ def cmd_export(a) -> int:
     return 0
 
 
+def saves_of(t: dict) -> int:
+    """保存した回数。attempts は「次に使うコミット番号」（dispatch で 1）なので、1 引く。"""
+    return max(int(t.get("attempts") or 0) - 1, 0)
+
+
 def cmd_status(a) -> int:
     c = Ctx()
     ts = load_tasks(c)
@@ -571,29 +567,101 @@ def cmd_status(a) -> int:
         print("台帳: タスクなし")
     for k, t in ts.items():
         if t.get("state") != "paused":
-            print("%s  %s  %s 試行%s PR=%s" % (k, t.get("state"), t.get("worker"), t.get("attempts"), t.get("pr") or "-"))
+            print("%s  %s  %s 保存%s回 PR=%s" % (k, t.get("state"), t.get("worker"), saves_of(t), t.get("pr") or "-"))
     paused = {k: t for k, t in ts.items() if t.get("state") == "paused"}
     if paused:
         print("== 保留中のタスク ==")
         for k, t in paused.items():
-            print("%s  保留（%s、理由: %s）  %s 試行%s PR=%s" % (
-                k, t.get("paused_from"), t.get("pause_reason"), t.get("worker"), t.get("attempts"), t.get("pr") or "-"))
+            print("%s  保留（%s、理由: %s）  %s 保存%s回 PR=%s" % (
+                k, t.get("paused_from"), t.get("pause_reason"), t.get("worker"), saves_of(t), t.get("pr") or "-"))
     return 0
 
 
-def stats_rows(tasks):
+def claude_log_stats(path: Path) -> dict:
+    """Claude のワーカーのログ（stream-json）1 本から、費用・要求の数・最大の文脈を集める。
+
+    - 費用: result の total_cost_usd は 1 回の起動の中で増えていくので、最大の値を取る。
+    - cumulative: 費用が前のログからの累積か（上の注を参照）。
+    - 要求: assistant の message.id で重複を除く（同じ要求が複数の行に分かれて出る）。
+    - 文脈: 要求ごとの入力側のトークン（入力＋キャッシュの作成＋キャッシュの読み出し）の最大。
+      output_tokens は途中の値なので使わない。
+    """
+    cost, ids, context = 0.0, {}, 0
+    model_cache = 0
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return {"cost": 0.0, "requests": 0, "max_context": 0, "cumulative": False}
+    for line in lines:
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(d, dict):
+            continue
+        if d.get("type") == "result":
+            try:
+                cost = max(cost, float(d.get("total_cost_usd") or 0))
+            except (TypeError, ValueError):
+                pass
+            usage = d.get("modelUsage")
+            if isinstance(usage, dict):
+                model_cache = sum(int(v.get("cacheReadInputTokens") or 0) for v in usage.values() if isinstance(v, dict))
+        elif d.get("type") == "assistant" and isinstance(d.get("message"), dict):
+            m = d["message"]
+            u = m.get("usage") or {}
+            if m.get("id"):
+                ids[m["id"]] = int(u.get("cache_read_input_tokens") or 0)
+            used = sum(int(u.get(k) or 0) for k in
+                       ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+            context = max(context, used)
+    # --resume のログの費用は、前の起動からの累積の時とそうでない時がある。最後の result の
+    # modelUsage のキャッシュ読み出しが、このログの assistant の合計より大きければ累積。
+    return {"cost": cost, "requests": len(ids), "max_context": context,
+            "cumulative": model_cache > sum(ids.values())}
+
+
+def _log_number(p: Path) -> int:
+    m = re.search(r"_(\d+)\.jsonl$", p.name)
+    return int(m.group(1)) if m else 0
+
+
+def task_claude_stats(logs: Path | None, key: str) -> dict:
+    """タスク（"repo#n"）の claude_<repo>_<n>_*.jsonl を全部足す（文脈は最大）。"""
+    out = {"cost": 0.0, "requests": 0, "max_context": 0}
+    if logs is None or "#" not in key:
+        return out
+    repo, n = key.rsplit("#", 1)
+    prev = 0.0
+    for p in sorted(logs.glob("claude_%s_%s_*.jsonl" % (repo, n)), key=_log_number):
+        s = claude_log_stats(p)
+        out["cost"] += s["cost"] - prev if s["cumulative"] else s["cost"]
+        prev = s["cost"]
+        out["requests"] += s["requests"]
+        out["max_context"] = max(out["max_context"], s["max_context"])
+    return out
+
+
+def stats_rows(tasks, logs: Path | None = None):
     rows = {}
-    for t in tasks.values():
+    for key, t in tasks.items():
         model = t.get("worker")
         if not model:
             continue
         row = rows.setdefault(model, {"count": 0, "accepted": 0, "rejected": 0,
-                                      "attempts": 0, "violations": {}, "duration_hours": []})
+                                      "attempts": 0, "saves": 0, "violations": {}, "duration_hours": [],
+                                      "cost": 0.0, "requests": 0, "max_context": 0, "per_task": {}})
         row["count"] += 1
         state = t.get("state")
         if state in ("accepted", "rejected"):
             row[state] += 1
         row["attempts"] += int(t.get("attempts") or 0)
+        row["saves"] += saves_of(t)
+        cs = task_claude_stats(logs, key)
+        row["per_task"][key] = cs
+        row["cost"] += cs["cost"]
+        row["requests"] += cs["requests"]
+        row["max_context"] = max(row["max_context"], cs["max_context"])
         for key, value in t.items():
             if value and (key.endswith("_violation") or key == "violations"):
                 row["violations"][key] = row["violations"].get(key, 0) + 1
@@ -606,7 +674,8 @@ def stats_rows(tasks):
 
 
 def cmd_stats(a) -> int:
-    rows = stats_rows(load_tasks(Ctx()))
+    c = Ctx()
+    rows = stats_rows(load_tasks(c), c.data / "logs")
     if not rows:
         print("台帳: タスクなし")
     for model, row in sorted(rows.items()):
@@ -614,10 +683,22 @@ def cmd_stats(a) -> int:
         durations = row["duration_hours"]
         violations = ", ".join("%s=%d" % item for item in sorted(row["violations"].items())) or "なし"
         duration = "%.2f時間" % (sum(durations) / len(durations)) if durations else "不明"
-        print("%s: 件数 %d、合格 %d、却下 %d、合格率 %.1f%%、平均試行 %.2f、違反 %s、平均所要 %s" % (
-            model, n, row["accepted"], row["rejected"], row["accepted"] * 100 / n,
-            row["attempts"] / n, violations, duration))
+        print("%s: 件数 %d、合格 %d、却下 %d、合格率 %.1f%%、平均保存 %.2f回、違反 %s、平均所要 %s、"
+              "費用 $%.2f、要求 %d、最大の文脈 %d" % (
+                  model, n, row["accepted"], row["rejected"], row["accepted"] * 100 / n,
+                  row["saves"] / n, violations, duration, row["cost"], row["requests"], row["max_context"]))
+        for key, cs in sorted(row["per_task"].items()):
+            if cs["requests"] or cs["cost"]:
+                print("  %s: 費用 $%.2f、要求 %d、最大の文脈 %d" % (key, cs["cost"], cs["requests"], cs["max_context"]))
     return 0
+
+
+def stats_summary(c: Ctx) -> list[str]:
+    """start で出す数行。モデルごとの件数・合格・費用・最大の文脈。"""
+    rows = stats_rows(load_tasks(c), c.data / "logs")
+    return ["%s: 件数 %d、合格 %d、費用 $%.2f、要求 %d、最大の文脈 %d" % (
+        m, r["count"], r["accepted"], r["cost"], r["requests"], r["max_context"])
+        for m, r in sorted(rows.items())] or ["台帳: タスクなし"]
 
 
 def cmd_start(a) -> int:
@@ -663,21 +744,9 @@ def cmd_start(a) -> int:
         print("不明")
     else:
         print("5h %s%%（更新 %s）" % (u, datetime.datetime.fromtimestamp(up.stat().st_mtime).isoformat(timespec="seconds")))
-    print("== 定期作業 ==")
-    per = periodic(c)
-    for name, days in (("weekly", 7), ("restore-test", 30)):
-        last = per.get(name)
-        if not last:
-            print("%s: 未実施" % name)
-            continue
-        age = (datetime.datetime.now().astimezone() - datetime.datetime.fromisoformat(last)).days
-        print("%s: %s（%d日前）%s" % (name, last, age, " ← 間が空いた" if age >= days else ""))
-    for build in export_builds(c):
-        full_at = export_state(c).get("builds", {}).get(build, {}).get("full_at")
-        age = (datetime.datetime.now().astimezone() - datetime.datetime.fromisoformat(full_at)).days if full_at else None
-        print("全関数の書き出し %s: %s%s" % (build, full_at or "未実施",
-              " ← 作り直す（python scripts/orch.py export --build %s）" % build if age is None or age >= 7 else ""))
-    report_consolidation(c, DEFAULT_REPO, skip_missing=True)
+    print("== 測定 ==")
+    for line in stats_summary(c):
+        print(line)
     mirror(c)
     return 0
 
@@ -1103,9 +1172,20 @@ def save_task(c: Ctx, t: dict, message: str | None = None) -> bool:
         op = idb_open_files(Path(t["idb"]["path"]))
         if op:
             raise OrchError("IDB のコピーが開いたまま（%s）。閉じてから save する" % ", ".join(op))
-    if not git(c, wt, "status", "--porcelain").strip():
-        print("%s: 変更なし（何もしない）" % key)
-        return False
+    dirty = bool(git(c, wt, "status", "--porcelain").strip())
+    if not dirty:
+        # 変更が無くても、コミットが push されていない・PR が無い時は、push と PR の作成までする。
+        base = base_ref(c, wt)
+        has_commits = int(git(c, wt, "rev-list", "--count", "%s..HEAD" % base, check=False).strip() or 0) > 0
+        remote = "refs/remotes/origin/%s" % t["branch"]
+        if git_ok(c, wt, "rev-parse", "--verify", "-q", remote):
+            unpushed = int(git(c, wt, "rev-list", "--count", "%s..HEAD" % remote, check=False).strip() or 0) > 0
+        else:
+            unpushed = True
+        if not has_commits or not (unpushed or not t.get("pr")):
+            print("%s: 変更なし（何もしない）" % key)
+            return False
+        print("%s: 変更は無いが、push か PR が済んでいないので続きを行う" % key)
     n = t.get("attempts", 1)
     msg = "試行 %s: %s" % (n, message or "作業の保存")
     pr_title = pr_body = None
@@ -1114,8 +1194,9 @@ def save_task(c: Ctx, t: dict, message: str | None = None) -> bool:
         pr_title = t.get("title") or "Issue #%s" % t["issue"]
         pr_body = "Closes #%s\n\n%s\n\n%s" % (t["issue"], message or "試行 %s の作業内容。" % n, footer)
         outgoing(pr_title, pr_body)
-    commit_all(c, wt, msg)
-    update_task(c, key, attempts=n + 1)  # コミットしたら番号を進める（次の保存が同じ番号にならないように）
+    if dirty:
+        commit_all(c, wt, msg)
+        update_task(c, key, attempts=n + 1)  # コミットしたら番号を進める（次の保存が同じ番号にならないように）
     git(c, wt, "push", "-u", "origin", t["branch"])
     fields = {"state": "saved", "saved_at": now(), "saved_head": head(c, wt), "stamped_head": None}
     if pr_title:
@@ -1135,7 +1216,7 @@ def cmd_save(a) -> int:
 
 
 # ---------- report / codex ----------
-REPORT_HEADER = "（ワーカーの最終の返答をオーケストラが保存した）"
+REPORT_HEADER = "（ワーカーの最終の返答を司令塔が保存した）"
 
 
 def require_active(t: dict) -> None:
@@ -1435,10 +1516,16 @@ CLAUDE_DENIED_TOOLS = ("Agent", "Task", "ListAgents", "SendMessage", "SendToProj
                        "CronCreate", "CronDelete", "CronList", "ScheduleWakeup", "RemoteTrigger", "PushNotification",
                        "EnterWorktree", "ExitWorktree", "DesignSync")
 REVIEW_WORKER = "opus-5.5"  # 深い検証の役のモデル（.claude/agents/reviewer.md の model と同じ）
-# 作業ツリーの親の CLAUDE.md の「メインのセッションならオーケストラ」を、ワーカーが自分の事と読まないようにする。
-CLAUDE_WORKER_ROLE = """このセッションは、オーケストラが CLI から起動したワーカーです。あなたはオーケストラではありません。
-CLAUDE.md の「メインのセッションなら、あなたはオーケストラです」と、スキル orchestrate・dispatch・evaluate・finalize・wrapup は、このセッションには当てはまりません。依頼文のとおりに、自分で作業をしてください。AGENTS.md の「ワーカーとして呼ばれた場合」の規則に従ってください。
-長くかかる試験やビルドは run_in_background で起動し、終わるまでターンを終えて待ってください。終わると完了の知らせで続きが始まります。最後の返答を、オーケストラが報告として受け取ります。"""
+# 作業ツリーの親の CLAUDE.md の「メインのセッションなら司令塔」を、ワーカーが自分の事と読まないようにする。
+CLAUDE_WORKER_ROLE = """このセッションは、司令塔が CLI から起動したワーカーです。あなたは司令塔ではありません。
+CLAUDE.md の「メインのセッションなら、あなたは司令塔です」と、スキル orchestrate・dispatch・evaluate・finalize・wrapup は、このセッションには当てはまりません。依頼文のとおりに、自分で作業をしてください。AGENTS.md の「ワーカーとして呼ばれた場合」の規則に従ってください。
+長くかかる試験やビルドは run_in_background で起動し、終わるまでターンを終えて待ってください。終わると完了の知らせで続きが始まります。最後の返答を、司令塔が報告として受け取ります。"""
+# ワーカーに渡す道具（--tools）。IDA の作業では MCP の道具を探せるよう ToolSearch を足す。
+CLAUDE_TOOLS = ("Read", "Edit", "Write", "Grep", "Glob", "Bash", "PowerShell")
+CLAUDE_MCP_TOOLS = ("ToolSearch",)
+# 文脈の自動圧縮の窓と、1 回のファイル読み取りの上限（operations.md 8.2 C1・C2）。
+CLAUDE_WORKER_ENV = {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "100000", "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS": "8000"}
+DEFAULT_MAX_BUDGET_USD = 5
 
 
 def find_claude() -> str:
@@ -1463,10 +1550,15 @@ def claude_system_prompt(c: Ctx, agent: str) -> str:
     return CLAUDE_WORKER_ROLE + "\n\n" + body.strip()
 
 
-def claude_cmd(exe: str, model: str, effort: str, system_prompt: str, session: str, resume: bool, use_mcp: bool) -> list[str]:
+def claude_cmd(exe: str, model: str, effort: str, system_prompt: str, session: str, resume: bool, use_mcp: bool,
+               tools: tuple[str, ...] | None = None, max_budget_usd: float | None = None) -> list[str]:
     cmd = [exe, "-p", "--model", model, "--effort", effort, "--output-format", "stream-json", "--verbose",
            "--permission-mode", "bypassPermissions", "--disallowedTools", ",".join(CLAUDE_DENIED_TOOLS),
            "--append-system-prompt", system_prompt]
+    if tools:
+        cmd += ["--tools", ",".join(tools + (CLAUDE_MCP_TOOLS if use_mcp else ()))]
+    if max_budget_usd:
+        cmd += ["--max-budget-usd", "%g" % max_budget_usd]
     cmd += ["--resume", session] if resume else ["--session-id", session]
     if not use_mcp:
         cmd.append("--strict-mcp-config")  # IDA を使わない作業では MCP のサーバーを起動しない
@@ -1475,7 +1567,19 @@ def claude_cmd(exe: str, model: str, effort: str, system_prompt: str, session: s
 
 def claude_env(c: Ctx) -> dict:
     """ワーカー用の環境変数。親のセッションの CLAUDE* を残すと、入れ子の起動として扱われる。"""
-    return {k: v for k, v in child_env(c).items() if not k.startswith("CLAUDE") or k == "CLAUDE_CONFIG_DIR"}
+    env = {k: v for k, v in child_env(c).items() if not k.startswith("CLAUDE") or k == "CLAUDE_CONFIG_DIR"}
+    env.update(CLAUDE_WORKER_ENV)
+    return env
+
+
+def worker_agent(c: Ctx, repo: str) -> str:
+    """ワーカーの定義はリポジトリの役割で選ぶ（analysis は re-analyst、derived は tooling）。"""
+    role = (c.ws.get("repos", {}).get(repo) or {}).get("role")
+    if role == "analysis":
+        return "re-analyst"
+    if role == "derived":
+        return "tooling"
+    raise OrchError("リポジトリ %s の role が analysis でも derived でもない（%s）" % (repo, role))
 
 
 def run_claude(c: Ctx, cmd: list[str], cwd: Path, prompt: str, log: Path) -> usage_watch.GuardRun:
@@ -1526,6 +1630,10 @@ def show_claude_run(r: usage_watch.GuardRun, model: str, effort: str, started: f
     message = result.get("result") if isinstance(result.get("result"), str) else ""
     print("== 最後の返答 ==")
     print(message)
+    if str(result.get("subtype") or "").startswith("error_max_budget"):
+        # 費用の上限で止まった。利用枠で止めた時と同じく、続きを頼める。報告は保存しない。
+        print("費用の上限で止まった（%s）。続きは orch.py claude --resume --message-file <f> で頼む" % result.get("subtype"))
+        return CODEX_STOPPED_RC, message
     rc = 1 if r.returncode != 0 or result.get("is_error") else 0
     if rc:
         print("エラーで終わった（%s）。報告は保存しない" % result.get("subtype"))
@@ -1545,6 +1653,13 @@ def append_report(t: dict, text: str) -> Path:
     return f
 
 
+def previous_claude_cost(c: Ctx, repo: str, n) -> float:
+    """そのタスクの最新の claude ログの、result の total_cost_usd。"""
+    logs = c.data / "logs"
+    found = sorted(logs.glob("claude_%s_%s_*.jsonl" % (repo, n)), key=_log_number) if logs.is_dir() else []
+    return claude_log_stats(found[-1])["cost"] if found else 0.0
+
+
 def cmd_claude(a) -> int:
     c = Ctx()
     need_repo(c, a.repo)
@@ -1560,12 +1675,15 @@ def cmd_claude(a) -> int:
         raise OrchError("effort が台帳に無い。--effort で指定する")
     if a.resume and not a.message_file:
         raise OrchError("--resume には --message-file が要る")
-    if a.message_file and not a.resume:
-        raise OrchError("--message-file は --resume と一緒に指定する")
     if a.resume:
         session = t.get("claude_session")
         if not session:
             raise OrchError("続きに使うセッションが台帳に無い")
+        prompt_file = a.message_file
+        prompt = read_source(prompt_file)
+    elif a.message_file:
+        # 続きでなく、新しいセッションで --message-file を依頼文にする（直しの頼み方）。
+        session = str(uuid.uuid4())
         prompt_file = a.message_file
         prompt = read_source(prompt_file)
     else:
@@ -1577,9 +1695,13 @@ def cmd_claude(a) -> int:
     wt = Path(t["worktree"])
     if not wt.is_dir():
         raise OrchError("作業ツリーが無い: %s" % wt)
-    worker = c.workers.get("workers", {}).get(t.get("worker")) or {}
-    system_prompt = claude_system_prompt(c, worker.get("agent") or "tooling")
-    cmd = claude_cmd(find_claude(), model, effort, system_prompt, session, a.resume, bool(t.get("idb")))
+    system_prompt = claude_system_prompt(c, worker_agent(c, a.repo))
+    budget = c.workers.get("limits", {}).get("max_budget_usd", DEFAULT_MAX_BUDGET_USD)
+    if a.resume and budget:
+        # --resume の total_cost_usd は前回からの累積。上限は「前回までの費用＋今回の分」にする。
+        budget += previous_claude_cost(c, a.repo, a.issue)
+    cmd = claude_cmd(find_claude(), model, effort, system_prompt, session, a.resume, bool(t.get("idb")),
+                     tools=CLAUDE_TOOLS, max_budget_usd=budget)
     if a.dry_run:
         print("dry-run: 実行しない。コマンド:")
         print(subprocess.list2cmdline(cmd))
@@ -2115,7 +2237,7 @@ def cmd_reject(a) -> int:
     return 0
 
 
-# ---------- wrapup / weekly ----------
+# ---------- wrapup ----------
 def next_step(wt: Path) -> str:
     n = wt / ".task" / "notes.md"
     if not n.exists():
@@ -2148,7 +2270,7 @@ def cmd_wrapup(a) -> int:
         sec.append("- 動いているタスクなし")
     h = c.data / "orchestrator" / "handoff.md"
     h.parent.mkdir(parents=True, exist_ok=True)
-    old = h.read_text(encoding="utf-8") if h.exists() else "# 引き継ぎメモ（オーケストラ）\n"
+    old = h.read_text(encoding="utf-8") if h.exists() else "# 引き継ぎメモ（司令塔）\n"
     lines = old.splitlines()
     i = 1 if lines and lines[0].startswith("# ") else 0
     new = lines[:i] + [""] + sec + [""] + lines[i:]
@@ -2159,32 +2281,77 @@ def cmd_wrapup(a) -> int:
     return 0
 
 
-def cmd_weekly(a) -> int:
+# ---------- verify ----------
+VERIFY_TIMEOUT_SEC = 1800
+
+
+def verify_files(c: Ctx, wt: Path, base: str) -> list[str]:
+    """差分のファイル（基点との差＋未追跡）。"""
+    mb = git(c, wt, "merge-base", base, "HEAD").strip() or base
+    names = git(c, wt, "diff", "--name-only", mb).splitlines()
+    names += git(c, wt, "ls-files", "--others", "--exclude-standard").splitlines()
+    return sorted({n for n in names if n and (wt / n).exists()})
+
+
+def run_verify_command(c: Ctx, wt: Path, command: str, files: list[str]) -> tuple[int, str]:
+    """コマンドを作業ツリーで走らせ、（終了コード、出力）を返す。{files} は差分のファイルの一覧に置き換える。"""
+    parts = shlex.split(command)
+    if "{files}" in parts:
+        i = parts.index("{files}")
+        if not files:
+            return 0, "（差分のファイルが無いので走らせない）"
+        parts[i:i + 1] = files
+    if parts and parts[0] == "python":
+        parts[0] = sys.executable
+    try:
+        r = subprocess.run(parts, cwd=str(wt), env=child_env(c), capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=VERIFY_TIMEOUT_SEC)
+    except FileNotFoundError as e:
+        return 127, "起動できない: %s" % e
+    except subprocess.TimeoutExpired:
+        return 124, "時間切れ（%d 秒）" % VERIFY_TIMEOUT_SEC
+    return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+
+def cmd_verify(a) -> int:
+    """作業ツリーでビルドと試験を LLM なしで走らせ、結果と差分を 1 つのファイルにまとめる（accept の前提にはしない）。"""
     c = Ctx()
     need_repo(c, a.repo)
-    since = datetime.datetime.now().astimezone() - datetime.timedelta(days=7)
-
-    def recent(t, f):
-        return t.get(f) and datetime.datetime.fromisoformat(t[f]) >= since
-
-    ts = list(load_tasks(c).values())
-    acc = [t for t in ts if recent(t, "accepted_at")]
-    rej = [t for t in ts if recent(t, "rejected_at")]
-    retry = sum(max(t.get("attempts", 1) - 1, 0) for t in ts if recent(t, "dispatched_at") or recent(t, "accepted_at"))
-    models: dict[str, int] = {}
-    for t in ts:
-        if recent(t, "dispatched_at") or recent(t, "accepted_at") or recent(t, "rejected_at"):
-            models[t.get("worker", "?")] = models.get(t.get("worker", "?"), 0) + 1
-    title = "[週報] %s" % datetime.date.today().isoformat()
-    body = "直近7日の集計\n\n- 取り込み: %d\n- 却下: %d\n- 再試行: %d\n- モデル別:\n%s\n" % (
-        len(acc), len(rej), retry, "\n".join("  - %s: %d" % kv for kv in sorted(models.items())) or "  - なし")
-    outgoing(title, body)
-    out = gh_run(["issue", "create", "--repo", repo_slug(c, a.repo), "--title", title, "--body", body, "--label", "report"])
-    per = periodic(c)
-    per["weekly"] = now()
-    (c.state / "periodic.json").write_text(json.dumps(per, indent=2) + "\n", encoding="utf-8", newline="\n")
-    print("週報を作成: #%s" % pr_number(out))
-    return 0
+    t = get_task(c, a.repo, a.issue)
+    require_unpaused(t)
+    wt = Path(t["worktree"])
+    if not wt.is_dir():
+        raise OrchError("作業ツリーが無い: %s" % wt)
+    commands = (c.ws.get("repos", {}).get(a.repo) or {}).get("verify") or []
+    if not commands:
+        raise OrchError("workspace.toml の repos.%s に verify が無い" % a.repo)
+    base = base_ref(c, wt)
+    files = verify_files(c, wt, base)
+    results = []
+    for command in commands:
+        rc, out = run_verify_command(c, wt, command, files)
+        results.append((command, rc, out))
+    mb = git(c, wt, "merge-base", base, "HEAD", check=False).strip() or base
+    parts = ["# 機械の検証 %s#%s\n" % (a.repo, a.issue), "## コマンドの結果\n"]
+    for command, rc, out in results:
+        tail = "\n".join(out.splitlines()[-20:])
+        parts.append("### `%s`\n\n終了コード: %d\n\n```\n%s\n```\n" % (command, rc, tail))
+    parts.append("## git diff --stat\n\n```\n%s\n```\n" % git(c, wt, "diff", "--stat", mb, check=False).rstrip())
+    parts.append("## 差分の全部\n\n```diff\n%s\n```\n" % git(c, wt, "diff", mb, check=False).rstrip())
+    untracked = git(c, wt, "ls-files", "--others", "--exclude-standard", check=False).split()
+    if untracked:
+        parts.append("## 未追跡のファイル\n\n%s\n" % "\n".join("- " + n for n in untracked))
+    rp = wt / ".task" / "report.md"
+    parts.append("## .task/report.md\n\n%s\n" % (rp.read_text(encoding="utf-8").rstrip() if rp.is_file() else "（無し）"))
+    pack = c.data / "orchestrator" / "pack" / ("%s-%s.md" % (a.repo, a.issue))
+    pack.parent.mkdir(parents=True, exist_ok=True)
+    pack.write_text("\n".join(parts), encoding="utf-8", newline="\n")
+    for command, rc, _ in results:
+        print("%s  %s（終了コード %d）" % ("合格" if rc == 0 else "不合格", command, rc))
+    ok = all(rc == 0 for _, rc, _ in results)
+    print("機械の検証: %s" % ("合格" if ok else "不合格"))
+    print("まとめ: %s" % pack)
+    return 0 if ok else 1
 
 
 # ---------- 入口 ----------
@@ -2212,7 +2379,8 @@ def main(argv=None) -> int:
     add("stats", cmd_stats, repo=False)
     add("capacity", cmd_capacity, repo=False)
     add("wrapup", cmd_wrapup, repo=False)
-    add("weekly", cmd_weekly)
+    s = add("verify", cmd_verify)
+    s.add_argument("issue", type=int)
     s = add("issue", cmd_issue)
     s.add_argument("--scope", required=True, choices=list(SCOPES))
     s.add_argument("--kind", required=True, choices=KINDS)
