@@ -167,7 +167,7 @@ def test_accept_refresh_uses_only_and_records_failure(tmp_path, monkeypatch):
     assert calls[0]["export_refresh"] == "失敗" and calls[0]["export_error"] == "fake failure"
 
 
-def test_start_export_schedule(tmp_path, monkeypatch, capsys):
+def test_start_does_not_print_export_schedule(tmp_path, monkeypatch, capsys):
     c = context(tmp_path)
     monkeypatch.setattr(orch, "Ctx", lambda: c)
     monkeypatch.setattr(orch, "load_tasks", lambda _: {})
@@ -175,11 +175,8 @@ def test_start_export_schedule(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(orch, "mirror", lambda _: None)
     c.repos = lambda: {}
     orch.cmd_start(None)
-    assert "全関数の書き出し one: 未実施 ← 作り直す" in capsys.readouterr().out
-    (c.state / "export.json").write_text(json.dumps({"builds": {"one": {
-        "full_at": orch.now()}}}), encoding="utf-8")
-    orch.cmd_start(None)
-    assert "全関数の書き出し one:" in capsys.readouterr().out
+    # start は書き出しの間隔を知らせない（運用の正本に無い）。
+    assert "全関数の書き出し" not in capsys.readouterr().out
 
 
 def test_dispatch_export_line(tmp_path, monkeypatch):

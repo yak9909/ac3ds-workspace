@@ -6,6 +6,8 @@ role = "analysis"
 required = true
 remote = "https://github.com/yak9909/ac3ds-re.git"
 hooks = ".githooks"
+# orch.py verify が作業ツリーで走らせる機械の検証。{files} は差分のファイルの一覧に置き換わる。
+verify = ["python tools/audit.py", "python tools/kb.py lint"]
 
 # 派生リポジトリ（任意）。作ったら追記する。
 [repos.gohan]
@@ -13,6 +15,7 @@ role = "derived"
 required = false
 remote = "https://github.com/yak9909/gohan.git"
 hooks = "../scripts/hooks/derived"
+verify = ["make -j4 DEV=1", "python tests/host/run.py", "python -m pytest tests/tools", "python tools/check.py --staged {files}"]
 
 [local_only]
 # 作業場の直下に置いてよい、Git に入れないファイル

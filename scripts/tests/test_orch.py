@@ -556,7 +556,7 @@ def test_wrapup_handoff(env):
     (wt / ".task" / "notes.md").write_text("## 経過\nx\n## 次の1手\n0x100000 の呼び出し元を見る\n", encoding="utf-8")
     h = ws / "_local" / "orchestrator" / "handoff.md"
     h.parent.mkdir(parents=True, exist_ok=True)
-    h.write_text("# 引き継ぎメモ（オーケストラ）\n\n## 古い節\n- a\n", encoding="utf-8")
+    h.write_text("# 引き継ぎメモ（司令塔）\n\n## 古い節\n- a\n", encoding="utf-8")
     assert run("wrapup") == 0
     text = h.read_text(encoding="utf-8")
     assert text.startswith("# 引き継ぎメモ")
@@ -667,7 +667,7 @@ def test_report_from_file_and_stdin(env, capsys, monkeypatch, tmp_path):
     src = tmp_path / "r.md"
     src.write_bytes("# 報告\r\n\r\n結論: 試験\r\n".encode("utf-8"))
     assert run("report", "5", "--from", str(src)) == 0
-    assert rep.read_bytes().decode("utf-8") == "（ワーカーの最終の返答をオーケストラが保存した）\n# 報告\n\n結論: 試験\n"
+    assert rep.read_bytes().decode("utf-8") == "（ワーカーの最終の返答を司令塔が保存した）\n# 報告\n\n結論: 試験\n"
     monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO("標準入力の報告\n".encode("utf-8")), encoding="utf-8"))
     assert run("report", "5", "--from", "-") == 0
     assert "上書き" in capsys.readouterr().out
@@ -741,7 +741,7 @@ def test_codex_runs_and_saves_log_and_report(env, capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "最後の返答です" in out and "エラー行（ERROR を含む）: 1 件" in out
     assert (wt / ".task" / "report.md").read_text(encoding="utf-8") == \
-        "（ワーカーの最終の返答をオーケストラが保存した）\n最後の返答です\n"
+        "（ワーカーの最終の返答を司令塔が保存した）\n最後の返答です\n"
 
 
 def test_codex_stopped_by_guard_keeps_log_and_resumable(env, capsys, monkeypatch):
@@ -838,16 +838,20 @@ def test_claude_runs_as_main_session_and_saves_the_last_result(env, capsys, monk
     denied = cmd[cmd.index("--disallowedTools") + 1].split(",")
     assert "Agent" in denied and "Task" in denied and "Monitor" in denied
     assert "--strict-mcp-config" in cmd
-    # 親の CLAUDE.md のオーケストラの段落を自分の事と読まない。定義の本文も渡す（front matter は渡さない）。
+    # 親の CLAUDE.md の司令塔の段落を自分の事と読まない。定義の本文も渡す（front matter は渡さない）。
     system = cmd[cmd.index("--append-system-prompt") + 1]
-    assert "あなたはオーケストラではありません" in system and "道具づくりのワーカー" in system and "name: tooling" not in system
+    # ac3ds-re は analysis なので re-analyst の本文が入る（front matter は入らない）
+    assert "あなたは司令塔ではありません" in system and "回答や思考は日本語で行う" in system and "name: re-analyst" not in system
+    # 道具の一覧と費用の上限を渡す。
+    assert cmd[cmd.index("--tools") + 1] == "Read,Edit,Write,Grep,Glob,Bash,PowerShell"
+    assert cmd[cmd.index("--max-budget-usd") + 1] == "5"
     t = tasks(ws)["ac3ds-re#5"]
     assert cmd[cmd.index("--session-id") + 1] == t["claude_session"]
     assert prompt == (ws / "_local" / "orchestrator" / "dispatch" / "5.md").read_text(encoding="utf-8")
     assert t["claude_finished_at"] and Path(t["claude_log"]) == ws / "_local" / "logs" / "claude_ac3ds-re_5_1.jsonl"
     assert "最後の報告です" in capsys.readouterr().out
     assert (wt / ".task" / "report.md").read_text(encoding="utf-8") == \
-        "（ワーカーの最終の返答をオーケストラが保存した）\n最後の報告です\n"
+        "（ワーカーの最終の返答を司令塔が保存した）\n最後の報告です\n"
 
 
 def test_claude_resume_uses_the_same_session_and_appends_the_report(env, monkeypatch):
@@ -938,7 +942,7 @@ def test_review_starts_a_new_session_and_leaves_the_worker_alone(env, monkeypatc
     assert cwd == wt and prompt == "記録を確かめてください\n"
     assert cmd[cmd.index("--model") + 1] == "claude-opus-5-5" and cmd[cmd.index("--effort") + 1] == "high"
     system = cmd[cmd.index("--append-system-prompt") + 1]
-    assert "あなたはオーケストラではありません" in system and "あなたは検証役です" in system
+    assert "あなたは司令塔ではありません" in system and "あなたは検証役です" in system
     assert "Agent" in cmd[cmd.index("--disallowedTools") + 1].split(",")
     t = tasks(ws)["ac3ds-re#5"]
     assert t["claude_session"] == worker_session and t["review_session"] == cmd[cmd.index("--session-id") + 1]
@@ -1003,6 +1007,7 @@ def test_claude_dry_run_prints_only_and_idb_task_keeps_mcp(env, monkeypatch, cap
     assert run("claude", "5", "--dry-run", "--model", "claude-opus-5-5", "--effort", "high") == 0
     out = capsys.readouterr().out
     assert "claude-opus-5-5" in out and "--strict-mcp-config" not in out
+    assert "ToolSearch" in out  # IDA を使う作業では MCP の道具を探す道具も足す
     assert not fc.calls and tasks(ws)["ac3ds-re#5"] == before
 
 
@@ -1012,6 +1017,162 @@ def test_claude_env_drops_the_parent_session(env, monkeypatch):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "x")
     child = orch.claude_env(orch.Ctx())
     assert "CLAUDECODE" not in child and "CLAUDE_CODE_ENTRYPOINT" not in child and child["CLAUDE_CONFIG_DIR"] == "x"
+    # 文脈の窓とファイル読み取りの上限は、親の CLAUDE* を落とした後で足す。
+    assert child["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "100000"
+    assert child["CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS"] == "8000"
+
+
+def test_claude_new_session_from_message_file_without_resume(env, monkeypatch):
+    ws, fake, _ = env
+    run("dispatch", "5", "--worker", "haiku-5.5", *precheck_args(ws))
+    use_claude(monkeypatch, ws, claude_jsonl("一回目"))
+    assert run("claude", "5") == 0
+    first = tasks(ws)["ac3ds-re#5"]["claude_session"]
+    message = ws / "_local" / "redo.md"
+    message.write_text("最初からやり直してください\n", encoding="utf-8")
+    fc = use_claude(monkeypatch, ws, claude_jsonl("二回目"))
+    assert run("claude", "5", "--message-file", str(message)) == 0
+    cmd, _, prompt = fc.calls[0]
+    assert prompt == "最初からやり直してください\n" and "--resume" not in cmd
+    second = cmd[cmd.index("--session-id") + 1]
+    assert second != first and tasks(ws)["ac3ds-re#5"]["claude_session"] == second
+
+
+def test_claude_stopped_by_budget_is_resumable_and_keeps_no_report(env, monkeypatch, capsys):
+    ws, fake, _ = env
+    run("dispatch", "5", "--worker", "haiku-5.5", *precheck_args(ws))
+    wt = Path(tasks(ws)["ac3ds-re#5"]["worktree"])
+    use_claude(monkeypatch, ws, claude_jsonl("途中です", is_error=True, subtype="error_max_budget_usd"))
+    assert run("claude", "5") == orch.CODEX_STOPPED_RC
+    assert "--resume" in capsys.readouterr().out
+    assert tasks(ws)["ac3ds-re#5"]["claude_session"] and not (wt / ".task" / "report.md").exists()
+
+
+def test_claude_log_stats_dedups_requests_and_ignores_output_tokens(tmp_path):
+    def asst(mid, inp, cache_c, cache_r, out):
+        return json.dumps({"type": "assistant", "message": {"id": mid, "usage": {
+            "input_tokens": inp, "cache_creation_input_tokens": cache_c,
+            "cache_read_input_tokens": cache_r, "output_tokens": out}}})
+    log = tmp_path / "claude_ac3ds-re_5_1.jsonl"
+    log.write_text("\n".join([
+        asst("m1", 10, 100, 0, 1), asst("m1", 10, 100, 0, 999),  # 同じ要求が 2 行に分かれる
+        asst("m2", 5, 0, 300, 2),
+        json.dumps({"type": "result", "total_cost_usd": 0.5}),
+        json.dumps({"type": "result", "total_cost_usd": 1.25}),
+        "not json"]) + "\n", encoding="utf-8")
+    s = orch.claude_log_stats(log)
+    assert s == {"cost": 1.25, "requests": 2, "max_context": 305, "cumulative": False}
+    log2 = tmp_path / "claude_ac3ds-re_5_2.jsonl"
+    log2.write_text(asst("m3", 1, 0, 0, 1) + "\n" + json.dumps({"type": "result", "total_cost_usd": 0.75}) + "\n",
+                    encoding="utf-8")
+    t = orch.task_claude_stats(tmp_path, "ac3ds-re#5")
+    assert t == {"cost": 2.0, "requests": 3, "max_context": 305}
+    assert orch.task_claude_stats(tmp_path, "ac3ds-re#6")["requests"] == 0
+
+
+def _cost_log(path, cost, asst_cache, model_cache):
+    lines = [json.dumps({"type": "assistant", "message": {"id": "m", "usage": {"cache_read_input_tokens": asst_cache}}}),
+             json.dumps({"type": "assistant", "message": {"id": "m", "usage": {"cache_read_input_tokens": asst_cache}}}),
+             json.dumps({"type": "result", "total_cost_usd": cost,
+                         "modelUsage": {"x": {"cacheReadInputTokens": model_cache}}})]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_task_claude_stats_counts_cumulative_resume_cost_once(tmp_path):
+    # 累積（modelUsage のキャッシュ読み出しがログの assistant の合計より大きい）
+    _cost_log(tmp_path / "claude_r_72_1.jsonl", 4.31, 100, 100)
+    _cost_log(tmp_path / "claude_r_72_2.jsonl", 6.86, 50, 150)
+    assert round(orch.task_claude_stats(tmp_path, "r#72")["cost"], 2) == 6.86
+    # 前の起動が止められ累積にならなかった _2、その累積の _3
+    _cost_log(tmp_path / "claude_r_83_1.jsonl", 0.67, 100, 100)
+    _cost_log(tmp_path / "claude_r_83_2.jsonl", 0.47, 80, 80)
+    _cost_log(tmp_path / "claude_r_83_3.jsonl", 0.79, 20, 100)
+    assert round(orch.task_claude_stats(tmp_path, "r#83")["cost"], 2) == 1.46
+
+
+def test_claude_resume_budget_adds_previous_cumulative_cost(env, monkeypatch):
+    ws, fake, _ = env
+    run("dispatch", "5", "--worker", "haiku-5.5", *precheck_args(ws))
+    first_log = json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "一回目",
+                            "total_cost_usd": 2.5}) + "\n"
+    fc = use_claude(monkeypatch, ws, first_log)
+    assert run("claude", "5") == 0
+    cmd = fc.calls[0][0]
+    first = float(cmd[cmd.index("--max-budget-usd") + 1])
+    message = ws / "_local" / "more.md"
+    message.write_text("続き\n", encoding="utf-8")
+    fc = use_claude(monkeypatch, ws, claude_jsonl("二回目"))
+    assert run("claude", "5", "--resume", "--message-file", str(message)) == 0
+    cmd = fc.calls[0][0]
+    assert float(cmd[cmd.index("--max-budget-usd") + 1]) == pytest.approx(first + 2.5)
+
+
+def test_stats_rows_shows_saves_not_next_commit_number_and_cost(tmp_path):
+    (tmp_path / "claude_ac3ds-re_5_1.jsonl").write_text(
+        json.dumps({"type": "result", "total_cost_usd": 0.3}) + "\n", encoding="utf-8")
+    rows = orch.stats_rows({"ac3ds-re#5": {"worker": "m", "state": "accepted", "attempts": 3}}, tmp_path)
+    assert rows["m"]["saves"] == 2 and rows["m"]["attempts"] == 3 and rows["m"]["cost"] == 0.3
+
+
+def test_save_pushes_and_creates_pr_when_only_unpushed_commits(env):
+    ws, fake, _ = env
+    dispatch(env)
+    wt = Path(tasks(ws)["ac3ds-re#5"]["worktree"])
+    (wt / "docs").mkdir(exist_ok=True)
+    (wt / "docs" / "a.md").write_text("a\n", encoding="utf-8")
+    g(wt, "add", "-A")
+    g(wt, "commit", "-m", "ワーカーが自分でコミット")
+    assert run("save", "5") == 0  # 作業ツリーは綺麗だが、push も PR も済んでいない
+    assert len(fake.named("pr", "create")) == 1
+    assert tasks(ws)["ac3ds-re#5"]["pr"] == 7
+    assert run("save", "5") == 0  # 今度は何もしない
+    assert len(fake.named("pr", "create")) == 1
+
+
+def test_verify_writes_pack_and_reports_pass_fail(env, capsys):
+    ws, fake, _ = env
+    dispatch(env)
+    wt = Path(tasks(ws)["ac3ds-re#5"]["worktree"])
+    (wt / "docs").mkdir(exist_ok=True)
+    (wt / "docs" / "a.md").write_text("a\n", encoding="utf-8")
+    (wt / ".task").mkdir(exist_ok=True)
+    (wt / ".task" / "report.md").write_text("報告の本文\n", encoding="utf-8")
+    toml = ws / "workspace.toml"
+    text = toml.read_text(encoding="utf-8")
+    toml.write_text(text.replace('[repos.ac3ds-re]', '[repos.ac3ds-re]\nverify = ["python -c \\"print(1)\\"", '
+                                 '"python -c \\"import sys; sys.exit(3)\\"", "python -c \\"print(0)\\" {files}"]', 1),
+                    encoding="utf-8")
+    assert run("verify", "5") == 1
+    out = capsys.readouterr().out
+    assert "不合格" in out and "終了コード 3" in out
+    pack = ws / "_local" / "orchestrator" / "pack" / "ac3ds-re-5.md"
+    assert str(pack) in out
+    body = pack.read_text(encoding="utf-8")
+    assert "終了コード: 3" in body and "git diff --stat" in body and "docs/a.md" in body and "報告の本文" in body
+    # 画面には合否の要約とパスだけ（差分や報告の本文は出さない）
+    assert "報告の本文" not in out and "+a" not in out
+
+
+def test_worker_agent_follows_repo_role():
+    from types import SimpleNamespace
+    c = SimpleNamespace(ws={"repos": {"a": {"role": "analysis"}, "d": {"role": "derived"}}})
+    assert orch.worker_agent(c, "a") == "re-analyst" and orch.worker_agent(c, "d") == "tooling"
+
+
+def test_stats_summary_lists_models(env):
+    ws, fake, _ = env
+    dispatch(env)
+    c = orch.Ctx()
+    assert any("件数 1" in l for l in orch.stats_summary(c))
+
+
+def test_verify_requires_commands(env):
+    ws, fake, _ = env
+    dispatch(env)
+    toml = ws / "workspace.toml"
+    toml.write_text("\n".join(l for l in toml.read_text(encoding="utf-8").splitlines()
+                              if not l.startswith("verify")) + "\n", encoding="utf-8")
+    assert run("verify", "5") == 1
 
 
 def test_last_claude_result_takes_the_last():

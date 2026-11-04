@@ -2,13 +2,13 @@
 
 [orchestrator]
 model = "opus-5.5"
-effort = "medium"
 
 [limits]
-max_parallel = 3            # 上限。段階1は1つずつ
+max_parallel = 3            # 上限
 stop_at_used_percent = 80   # 5時間枠の使用率がこれ以上なら新しい依頼を出さない
 legacy_work_share = 0.3     # 旧記録の作業（再解析・消化）に使う利用枠の上限
 retry_max = 3
+max_budget_usd = 5          # Claude のワーカー1回の起動の費用の上限。超えると止めて、続きを頼める
 
 [evaluation]
 pass_min = 0.6   # 採点表の全項目がこれ以上なら合格（較正 2026-10-15。0.7 だと正しい記録を落とした）
@@ -22,23 +22,20 @@ fallback = "gpt-6.1-sol"
 
 [workers."sonnet-5.5"]
 provider = "claude"
-agent = "re-analyst"
-default_effort = "low"
+default_effort = "medium"
 roles = ["analysis", "simple", "tooling"]
 
 [workers."haiku-5.5"]
 provider = "claude"
-agent = "tooling"
-default_effort = "xhigh"
+default_effort = "medium"
 roles = ["simple", "tooling", "analysis-light"]
 note = "2026-10-15〜。易しい作業全般と易しめの normal を最初に担当。駄目なら sonnet-5.5"
 
 [workers."opus-5.5"]
 provider = "claude"
-agent = "tooling"
 default_effort = "high"
 roles = ["design"]
-note = "2026-10-19〜。利用者の指定で、gohan の UI のデザインを担当。利用枠を多く使うので、他の作業には使わない"
+note = "2026-10-19〜。利用者の指定で、gohan の UI のデザインを担当。利用枠を多く使う"
 
 [workers."gpt-6.1-sol"]
 provider = "codex"
