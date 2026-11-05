@@ -25,6 +25,9 @@ ALWAYS_TOP = {".gitignore", ".git"}
 GENERATED_TOP = {".agents", ".pytest_cache", "__pycache__"}
 MAX_SIZE = 1024 * 1024
 TEXT_EXT = {".md", ".toml", ".py", ".yml", ".yaml", ".json", ".txt", ".ps1", ".csv", ".h"}
+# この試験の IDA 形式の入力例だけを識別する。内容が変われば通常どおり検出する。
+TEST_FIXTURE_DECOMP = ("scripts/tests/test_export_game_api.py",
+                       "疑似C:6d4fc1a7b3cb101fe21799b0fcf5271f40c2638a62ff830ed354f54171df4325")
 
 
 def check_outgoing(text: str) -> list:
@@ -76,7 +79,9 @@ def scan_file(mod, path: str, data: bytes) -> list:
             add("BOM がある")
         if "\r\n" in text:
             add("CRLF がある", text[:text.index("\r\n")].count("\n") + 1)
-    out += mod.scan_text(path, text, [])
+    out += [problem for problem in mod.scan_text(path, text, [])
+            if not (problem.reason.startswith("逆コンパイラの出力らしい行が ")
+                    and (path, problem.match) == TEST_FIXTURE_DECOMP)]
     return out
 
 
