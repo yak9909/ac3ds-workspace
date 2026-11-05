@@ -36,7 +36,8 @@ def accept_unit(tmp_path, monkeypatch):
     monkeypatch.setattr(orch, "read_usage", lambda *_: {})
     monkeypatch.setattr(orch.sync_skills, "check", lambda *_: False)
     monkeypatch.setattr(orch, "cleanup_task", lambda *_: None)
-    monkeypatch.setattr(orch, "report_consolidation", lambda *a, **kw: None)
+    monkeypatch.setattr(orch, "report_consolidation",
+                        lambda *a, **kw: pytest.fail("accept が消化の一覧を呼んだ"))
     monkeypatch.setattr(orch, "gh_run", lambda args: calls.append(("gh", args)))
     return tmp_path / "read.md", calls
 

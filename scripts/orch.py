@@ -2207,11 +2207,6 @@ def cmd_accept(a) -> int:
         refresh_export_after_accept(c, key, short)
     print("%s: 取り込み完了（%s、正本の取り込み: %s）" % (key, short, imp))
     cleanup_task(c, key, t, a.keep)
-    if a.repo == DEFAULT_REPO:
-        try:
-            report_consolidation(c, a.repo, skip_missing=True)
-        except (OrchError, OSError) as e:
-            print("警告: 消化の確認に失敗: %s" % e)
     return 1 if imp == "取り込み失敗" else 0
 
 
