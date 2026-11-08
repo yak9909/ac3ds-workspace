@@ -146,6 +146,7 @@ ac3ds-workspace/   作業場。司令塔はここで起動する
 - **Codex と Claude のどちらを優先するかは決めません。** 週の枠などの状況を見て、利用者がその都度指示します。指示が無い間は、直前の指示を続けます。
 - 格付けは `ac3ds-re/meta/models.toml` にあり、利用者が管理します。S は Opus 5.5、A は Sonnet 5.5・gpt-6.1-sol・gpt-6-astra、B は opus-5・gpt-sol-5.6・gpt-6-sol、C は Haiku 5.5・gpt-6-luna、? は gpt-6・unknown です。
 - `hard` は A 以上、`normal` は B 以上、`easy` は誰でも担当できます。
+- Codex は砂場を使わず全権限で起動する（2026-11-09 の利用者の方針。砂場では MSYS が止まり make が通らない）。
 
 | 作業 | Claude の場合 | effort の既定 |
 |---|---|---|
@@ -223,6 +224,15 @@ C1・C2 は細部が落ちたり読む回数が増えたりする恐れがあり
 - `.task/` は作業ブランチだけで使い、取り込みの前に消します。
 - 誤りの戻し方: 合格させた物が誤っていたら `git revert`。不合格にした物が正しかったら、閉じた PR からブランチを戻します。IDB の取り込みが誤っていたら、バックアップか symbols から作り直します。
 - コミットの作者は GitHub の noreply アドレスです。
+
+### 12.1 WebChat（外部の解析ワーカー）
+
+WebChat は ChatGPT の Web 画面で、利用者が手で操作します。台帳（`_local/state`）には載らず、ID の台帳も使えません。運用の手順書は `_local/orchestrator/webchat/project-prompt.md`（Git の外）です。
+
+- **ラベル**: `webchat`（WebChat が担当する Issue）と `作業中`（ワーカーが取って作業している Issue）の 2 つです。WebChat は Issue を取る時に `作業中` を付けます。`dispatch` は、どちらかが付いた Issue を断ります。`dispatch` が通ると `作業中` を付け、`accept` と `reject` の後に外します。
+- **依頼**: `orch.py issue --webchat ...`（解析リポジトリだけ）で、ラベル `webchat` と WebChat への指示を付けた Issue を作ります。
+- **受け箱**: WebChat は記録の下書きを `inbox/webchat/<Issue 番号>/<連番>.md` に置き、ブランチ `webchat/<Issue 番号>` から PR を出します。PR 本文の先頭は `Issue #N` です。PR の差分が受け箱の外に及ぶ物は取り込みません。
+- **取り込み**: `orch.py webchat verify <PR>`（ブランチを作業ツリーに取り出し、main に追いつかせ、機械の検証を走らせる）、`webchat accept <PR> --scores ... --read <ファイル>`（検証の後に `kb.py intake --issue N --by gpt-6-sol` で ID を振り、結果を push して PR にコメントし、取り込む。Issue は閉じる）、`webchat reject <PR> --reason ...`（PR を閉じる。Issue は開いたまま）です。採点表は解析の物を使います。
 
 ## 13. 派生リポジトリ
 

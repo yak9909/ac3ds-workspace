@@ -725,14 +725,11 @@ def test_codex_runs_and_saves_log_and_report(env, capsys, monkeypatch):
     cmd, cwd, prompt = fc.calls[0]
     assert cwd == wt
     assert cmd[:2] == ["codex", "exec"] and cmd[cmd.index("-C") + 1] == str(wt)
-    assert cmd[cmd.index("-s") + 1] == "workspace-write"
-    assert [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--add-dir"] == [
-        str(ws / "_local" / "state"), str(ws / "_local" / "evidence" / "5")]
-    assert (ws / "_local" / "evidence" / "5").is_dir()
+    assert "--dangerously-bypass-approvals-and-sandbox" in cmd
+    assert "-s" not in cmd and "--add-dir" not in cmd
     assert cmd[cmd.index("-m") + 1] == "gpt-6-sol"
     assert 'model_reasoning_effort="medium"' in cmd and cmd[-2:] == ["--json", "-"]
-    if os.name == "nt":
-        assert 'windows.sandbox="unelevated"' in cmd
+    assert 'windows.sandbox="unelevated"' not in cmd
     assert prompt == (ws / "_local" / "orchestrator" / "dispatch" / "5.md").read_text(encoding="utf-8")
     log = ws / "_local" / "logs" / "codex_ac3ds-re_5_1.jsonl"
     assert log.read_text(encoding="utf-8") == fc.out
@@ -1198,15 +1195,14 @@ def test_codex_dry_run_prints_only(env, monkeypatch, capsys):
     fc = use_codex(monkeypatch, codex_jsonl("x"))
     assert run("codex", "5", "--dry-run", "--model", "gpt-6-luna", "--effort", "xhigh") == 0
     out = capsys.readouterr().out
-    assert "gpt-6-luna" in out and "xhigh" in out and "--add-dir" in out
-    if os.name == "nt":
-        assert "unelevated" in out
+    assert "gpt-6-luna" in out and "xhigh" in out and "--dangerously-bypass-approvals-and-sandbox" in out
+    assert "--add-dir" not in out and "unelevated" not in out
     assert not fc.calls and not (ws / "_local" / "logs").exists()
     assert tasks(ws)["ac3ds-re#5"] == before
 
 
 @pytest.mark.parametrize("with_idb", [True, False])
-def test_codex_dry_run_sandbox_mode(env, monkeypatch, capsys, with_idb):
+def test_codex_dry_run_always_full_access(env, monkeypatch, capsys, with_idb):
     ws, _, _ = env
     args = ["dispatch", "5", "--worker", "gpt-6-sol", *precheck_args(ws)]
     assert run(*(args + (["--idb"] if with_idb else []))) == 0
@@ -1214,19 +1210,9 @@ def test_codex_dry_run_sandbox_mode(env, monkeypatch, capsys, with_idb):
     assert run("codex", "5", "--dry-run") == 0
     output = capsys.readouterr().out
     command = output.split("dry-run: 実行しない。コマンド:\n", 1)[1].splitlines()[-2]
-    if with_idb:
-        assert "サンドボックス無し（IDA を使うタスク）" in output
-        assert "--dangerously-bypass-approvals-and-sandbox" in command
-        assert " -s " not in command and "--add-dir" not in command
-        assert 'windows.sandbox=' not in command
-    else:
-        assert "サンドボックス無し" not in output
-        assert "--dangerously-bypass-approvals-and-sandbox" not in command
-        assert " -s workspace-write" in command
-        assert subprocess.list2cmdline(["--add-dir", str(ws / "_local" / "state")]) in command
-        assert subprocess.list2cmdline(["--add-dir", str(ws / "_local" / "evidence" / "5")]) in command
-        if os.name == "nt":
-            assert 'windows.sandbox=' in command
+    assert "--dangerously-bypass-approvals-and-sandbox" in command
+    assert " -s " not in command and "--add-dir" not in command
+    assert 'windows.sandbox=' not in command and "writable_roots" not in command
 
 
 @pytest.fixture
@@ -1250,12 +1236,6 @@ def codex_unit(tmp_path, monkeypatch):
     return c, wt, task
 
 
-@pytest.mark.parametrize("repo,name", [("ac3ds-re", "5"), ("derived", "derived-5")])
-def test_codex_evidence_dir_name(codex_unit, repo, name):
-    c, _, _ = codex_unit
-    assert orch.evidence_dir(c, repo, 5) == c.data / "evidence" / name
-
-
 @pytest.mark.parametrize("with_idb", [False, True])
 def test_codex_resume_uses_last_log_and_message_file(codex_unit, monkeypatch, tmp_path, capsys, with_idb):
     c, wt, task = codex_unit
@@ -1275,16 +1255,11 @@ def test_codex_resume_uses_last_log_and_message_file(codex_unit, monkeypatch, tm
     assert cwd == wt and prompt == "続きの依頼\n"
     assert "-C" not in cmd and "-s" not in cmd and "--add-dir" not in cmd
     assert cmd[-2:] == ["--json", "-"]
+    assert "--dangerously-bypass-approvals-and-sandbox" in cmd
+    assert not any("sandbox_workspace_write.writable_roots" in arg for arg in cmd)
+    assert 'windows.sandbox="unelevated"' not in cmd
     if with_idb:
-        assert "--dangerously-bypass-approvals-and-sandbox" in cmd
-        assert not any("sandbox_workspace_write.writable_roots" in arg for arg in cmd)
         assert "HEAD:" in task["git_violation"]
-    else:
-        assert "--dangerously-bypass-approvals-and-sandbox" not in cmd
-        roots = next(arg.split("=", 1)[1] for arg in cmd if arg.startswith("sandbox_workspace_write.writable_roots="))
-        assert tomllib.loads("roots = " + roots)["roots"] == [str(c.state), str(c.data / "evidence" / "5")]
-        assert (c.data / "evidence" / "5").is_dir()
-        assert ('windows.sandbox="unelevated"' in cmd) == (os.name == "nt")
     log = c.data / "logs" / "codex_ac3ds-re_5_1.jsonl"
     assert log.read_text(encoding="utf-8") == fc.out
     assert task["codex_log"] == str(log) and task["codex_finished_at"]
@@ -1508,3 +1483,262 @@ def test_parallel_limit_counts_only_running_tasks(env, monkeypatch, capsys, stat
     assert code == (1 if refused else 0)
     if refused:
         assert "推奨並列数 1 を超える（稼働中 1" in capsys.readouterr().err
+
+
+# ---------- ラベル・WebChat ----------
+def label_edits(fake):
+    out = []
+    for args, _ in fake.named("issue", "edit"):
+        flag = "--add-label" if "--add-label" in args else "--remove-label"
+        out.append((flag, args[args.index(flag) + 1]))
+    return out
+
+
+def test_labels_include_webchat_and_busy():
+    names = [n for n, _, _ in orch.LABELS]
+    assert "webchat" in names and "作業中" in names
+
+
+def test_setup_github_creates_webchat_labels(env):
+    ws, fake, _ = env
+    assert run("setup-github", "ac3ds-re") == 0
+    bodies = [json.loads(i) for a, i in fake.calls if a[:3] == ["api", "-X", "POST"] and a[3].endswith("/labels")]
+    assert {"webchat", "作業中"} <= {b["name"] for b in bodies}
+
+
+def test_set_label_failure_is_only_a_warning(env, capsys):
+    ws, fake, _ = env
+    fake.fail["issue edit"] = 1
+    c = orch.Ctx()
+    orch.set_label(c, "ac3ds-re", 5, "作業中", False)
+    assert "警告" in capsys.readouterr().out
+    orch.set_label(c, "ac3ds-re", 5, "作業中", True)
+    assert label_edits(fake) == [("--remove-label", "作業中"), ("--add-label", "作業中")]
+
+
+def test_dispatch_adds_busy_label_and_retry_is_allowed(env):
+    ws, fake, _ = env
+    assert dispatch(env) == 0
+    assert label_edits(fake) == [("--add-label", "作業中")]
+    fake.issue["labels"].append({"name": "作業中"})  # 自分で付けた物は、再試行を断らない
+    assert dispatch(env) == 0
+    assert label_edits(fake) == [("--add-label", "作業中")]
+
+
+@pytest.mark.parametrize("label", ["webchat", "作業中"])
+def test_dispatch_refuses_labeled_issue(env, capsys, label):
+    ws, fake, _ = env
+    fake.issue["labels"].append({"name": label})
+    assert dispatch(env) == 1
+    assert label in capsys.readouterr().err
+    assert not label_edits(fake) and not (ws / "_local" / "state" / "tasks.json").exists()
+
+
+def test_dispatch_label_failure_does_not_stop(env, capsys):
+    ws, fake, _ = env
+    fake.fail["issue edit"] = 1
+    assert dispatch(env) == 0
+    assert "警告" in capsys.readouterr().out and tasks(ws)["ac3ds-re#5"]["state"] == "dispatched"
+
+
+def test_reject_removes_busy_label(env):
+    ws, fake, origin, wt = ready(env)
+    assert run("reject", "5", "--reason", "足りない") == 0
+    assert label_edits(fake)[-1] == ("--remove-label", "作業中")
+
+
+def test_accept_removes_busy_label(env):
+    ws, fake, origin, wt = ready(env)
+    assert run("stamp", "5") == 0
+    assert run("accept", "5", "--scores", SCORES, *read_args(ws)) == 0
+    assert label_edits(fake)[-1] == ("--remove-label", "作業中")
+
+
+def issue_args(*extra):
+    return ["issue", "--scope", "acnl", "--kind", "analysis", "--difficulty", "easy", "--title", "調べる",
+            "--goal", "ある関数の役割", "--target", "0x00100000", "--materials", "ACNL-F0001", *extra]
+
+
+def test_issue_webchat_adds_label_and_instructions(env, capsys):
+    ws, fake, _ = env
+    assert run(*issue_args("--webchat")) == 0
+    args, _in = fake.named("issue", "create")[0]
+    labels = [args[i + 1] for i, x in enumerate(args) if x == "--label"]
+    assert labels == ["acnl", "analysis", "easy", "webchat"]
+    body = args[args.index("--body") + 1]
+    assert "### 目的と完了条件" in body and "ある関数の役割" in body and "0x00100000" in body
+    assert "inbox/webchat/<この Issue の番号>" in body and "webchat/<この Issue の番号>" in body
+    assert "webchat verify" in capsys.readouterr().out
+    # 付けなければ webchat のラベルも指示も付かない
+    assert run(*issue_args()) == 0
+    args2 = fake.named("issue", "create")[1][0]
+    assert "webchat" not in [args2[i + 1] for i, x in enumerate(args2) if x == "--label"]
+    assert "WebChat への指示" not in args2[args2.index("--body") + 1]
+
+
+@pytest.mark.parametrize("body,branch,want", [
+    ("Issue #12\n\n本文", "webchat/12", 12), ("  Issue #7 の下書き", "feature/x", 7), ("説明だけ", "webchat/9", 9),
+    ("Issue #3", "webchat/3", 3)])
+def test_webchat_issue_number(body, branch, want):
+    assert orch.webchat_issue_number(body, branch) == want
+
+
+@pytest.mark.parametrize("body,branch", [("説明だけ", "feature/x"), ("Issue #3", "webchat/4"), ("", "")])
+def test_webchat_issue_number_refused(body, branch):
+    with pytest.raises(orch.OrchError):
+        orch.webchat_issue_number(body, branch)
+
+
+def test_webchat_outside():
+    assert orch.webchat_outside(["inbox/webchat/5/01.md", "inbox/webchat/5/02.md"], 5) == []
+    assert orch.webchat_outside(["inbox/webchat/5/01.md", "tools/kb.py", "inbox/webchat/55/01.md"], 5) == [
+        "tools/kb.py", "inbox/webchat/55/01.md"]
+
+
+class WebchatGh:
+    """FakeGh に、WebChat の PR（ブランチ webchat/5）の応答を足した物。"""
+
+    def __init__(self, fake, origin, tmp):
+        self.fake, self.origin, self.tmp = fake, origin, tmp
+        self.info = {"number": 9, "state": "OPEN", "body": "Issue #5\n\n下書き", "headRefName": "webchat/5",
+                     "isDraft": False, "isCrossRepository": False, "files": [{"path": "inbox/webchat/5/01.md"}]}
+        self.calls = fake.calls
+
+    def named(self, *prefix):
+        return self.fake.named(*prefix)
+
+    def __call__(self, args, input_text=None):
+        if args[:2] == ["pr", "view"]:
+            self.calls.append((list(args), input_text))
+            if args[-1].endswith("headRefOid"):
+                return json.dumps({"headRefOid": g(self.origin, "rev-parse", "refs/heads/webchat/5").strip()})
+            return json.dumps(self.info)
+        if args[:3] == ["api", "-X", "PUT"] and args[3].endswith("/pulls/9/merge"):
+            self.calls.append((list(args), input_text))
+            cl = self.tmp / "mergeclone"
+            if cl.exists():
+                shutil.rmtree(cl)
+            g(self.tmp, "clone", str(self.origin), str(cl))
+            g(cl, "merge", "--no-ff", "-m", "merge", "origin/webchat/5")
+            g(cl, "push", "origin", "HEAD:main")
+            return ""
+        return self.fake(args, input_text)
+
+
+@pytest.fixture
+def webchat(env, monkeypatch, tmp_path):
+    ws, fake, origin = env
+    p = ws / "workspace.toml"
+    p.write_text(p.read_text(encoding="utf-8").replace(
+        'role = "analysis"\n', 'role = "analysis"\nverify = ["python -c pass"]\n', 1), encoding="utf-8")
+    re_ = ws / "ac3ds-re"
+    g(re_, "checkout", "-q", "-b", "webchat/5")
+    d = re_ / "inbox" / "webchat" / "5"
+    d.mkdir(parents=True)
+    (d / "01.md").write_text("下書き\n", encoding="utf-8")
+    g(re_, "add", "-A")
+    g(re_, "commit", "-m", "draft")
+    g(re_, "push", "origin", "webchat/5")
+    g(re_, "checkout", "-q", "main")
+    g(re_, "branch", "-D", "webchat/5")
+    gh = WebchatGh(fake, origin, tmp_path)
+    monkeypatch.setattr(orch, "gh_run", gh)
+    return ws, gh, origin
+
+
+@pytest.mark.parametrize("change", [
+    {"files": [{"path": "inbox/webchat/5/01.md"}, {"path": "tools/kb.py"}]},
+    {"files": [{"path": "inbox/webchat/6/01.md"}]}, {"files": []}, {"body": "Issue #6"},
+    {"body": "説明だけ", "headRefName": "other"}, {"state": "CLOSED"}, {"isCrossRepository": True}])
+def test_webchat_refuses_bad_pr(webchat, monkeypatch, capsys, change):
+    ws, gh, origin = webchat
+    gh.info.update(change)
+    monkeypatch.setattr(orch, "prepare_webchat", lambda *_: pytest.fail("作業ツリーを作った"))
+    assert run("webchat", "verify", "9") == 1
+    assert capsys.readouterr().err.startswith("エラー")
+
+
+def test_webchat_verify_checks_out_and_runs(webchat, capsys):
+    ws, gh, origin = webchat
+    assert run("webchat", "verify", "9") == 0
+    out = capsys.readouterr().out
+    wt = ws / "_local" / "worktrees" / "ac3ds-re" / "webchat-5"
+    assert (wt / "inbox" / "webchat" / "5" / "01.md").is_file() and "合格" in out and "01.md" in out
+    assert g(wt, "branch", "--show-current").strip() == "webchat/5"
+
+
+def test_webchat_verify_fails_when_command_fails(webchat, capsys):
+    ws, gh, origin = webchat
+    p = ws / "workspace.toml"
+    p.write_text(p.read_text(encoding="utf-8").replace('"python -c pass"', "'python -c \"raise SystemExit(3)\"'"),
+                 encoding="utf-8")
+    assert run("webchat", "verify", "9") == 1
+    assert "不合格" in capsys.readouterr().out
+
+
+def fake_intake(monkeypatch):
+    real = orch.run_py
+    calls = []
+
+    def run_py(c, wt, script, args):
+        calls.append(list(args))
+        if args[0] == "intake":
+            (wt / "inbox" / "webchat" / "5" / "01.md").unlink()
+            f = wt / "findings" / "acnl" / "0000" / "ACNL-F0001.md"
+            f.parent.mkdir(parents=True)
+            f.write_text("記録\n", encoding="utf-8")
+            return 0, "ACNL-F0001"
+        if args[0] == "lint":
+            return 0, ""
+        return real(c, wt, script, args)
+
+    monkeypatch.setattr(orch, "run_py", run_py)
+    return calls
+
+
+def test_webchat_accept_full(webchat, monkeypatch, capsys):
+    ws, gh, origin = webchat
+    calls = fake_intake(monkeypatch)
+    assert run("webchat", "accept", "9", "--scores", SCORES, *read_args(ws)) == 0
+    out = capsys.readouterr().out
+    assert ["intake", "--issue", "5", "--by", "gpt-6-sol"] in calls and "ACNL-F0001" in out
+    comment = [a for a, _ in gh.named("pr", "comment")][0]
+    assert comment[2] == "9" and "合格" in comment[-1] and "根拠と結論の一致=0.9" in comment[-1]
+    assert gh.named("api", "-X", "PUT")
+    assert label_edits(gh) == [("--remove-label", "作業中")]
+    assert gh.named("issue", "close")[0][0][2] == "5"
+    cl = ws / "check"
+    g(ws, "clone", str(origin), str(cl))
+    assert (cl / "findings" / "acnl" / "0000" / "ACNL-F0001.md").is_file()
+    assert not (cl / "inbox" / "webchat" / "5" / "01.md").exists()
+    assert not (ws / "_local" / "worktrees" / "ac3ds-re" / "webchat-5").exists()
+
+
+def test_webchat_accept_stops_when_intake_fails(webchat, monkeypatch, capsys):
+    ws, gh, origin = webchat
+    real = orch.run_py
+    monkeypatch.setattr(orch, "run_py", lambda c, wt, s, a: (1, "エラー: 下書きが不備") if a[0] == "intake" else real(c, wt, s, a))
+    assert run("webchat", "accept", "9", "--scores", SCORES, *read_args(ws)) == 1
+    assert "intake" in capsys.readouterr().err
+    assert not gh.named("api", "-X", "PUT") and not gh.named("pr", "comment") and not label_edits(gh)
+
+
+def test_webchat_accept_refuses_bad_scores_and_dry_run_writes_nothing(webchat, capsys):
+    ws, gh, origin = webchat
+    assert run("webchat", "accept", "9", "--scores", "根拠と結論の一致=0.9", *read_args(ws)) == 1
+    n = len(gh.calls)
+    assert run("webchat", "accept", "9", "--scores", SCORES, *read_args(ws), "--dry-run") == 0
+    assert "dry-run" in capsys.readouterr().out
+    assert not [c for c in gh.calls[n:] if c[0][0] in ("api", "issue")]
+    assert not (ws / "_local" / "worktrees" / "ac3ds-re" / "webchat-5").exists()
+
+
+def test_webchat_reject(webchat):
+    ws, gh, origin = webchat
+    assert run("webchat", "verify", "9") == 0
+    assert run("webchat", "reject", "9", "--reason", "連絡は " + FAKE_EMAIL) == 1
+    assert run("webchat", "reject", "9", "--reason", "根拠が足りない") == 0
+    assert "--delete-branch" in gh.named("pr", "close")[0][0]
+    assert gh.named("pr", "comment")[0][0][-1] == "却下: 根拠が足りない"
+    assert label_edits(gh) == [("--remove-label", "作業中")] and not gh.named("issue", "close")
+    assert not (ws / "_local" / "worktrees" / "ac3ds-re" / "webchat-5").exists()
