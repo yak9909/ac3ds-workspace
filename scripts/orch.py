@@ -239,6 +239,57 @@ def outside_status(c: Ctx) -> dict[str, list[str]]:
             for name, path in places.items() if (path / ".git").exists()}
 
 
+def _is_link(entry) -> bool:
+    return entry.is_symlink() or entry.is_junction()
+
+
+def _scan_links(path: Path) -> list[Path]:
+    """path の下のリンク（ジャンクション・シンボリックリンク）を、辿らずに集める。"""
+    found: list[Path] = []
+    stack = [Path(path)]
+    while stack:
+        d = stack.pop()
+        try:
+            it = os.scandir(d)
+        except FileNotFoundError:
+            continue
+        with it:
+            for e in it:
+                if _is_link(e):
+                    found.append(Path(e.path))
+                elif e.is_dir(follow_symlinks=False):
+                    stack.append(Path(e.path))
+    return found
+
+
+def unlink_links(path) -> list[Path]:
+    """path の下のリンクを、リンクそのものだけ消す（先の中身には触らない）。消したリンクの一覧を返す。
+    Git for Windows の worktree remove がジャンクションを辿って先を消す事故を防ぐ。"""
+    path = Path(path)
+    removed = _scan_links(path)
+    for link in removed:
+        try:
+            try:  # ジャンクション・ディレクトリのシンボリックリンクはリンク自体を rmdir
+                os.rmdir(link)
+            except OSError:
+                os.unlink(link)  # ファイルのシンボリックリンク
+        except OSError as e:
+            raise OrchError("リンクを外せない: %s: %s" % (link, e))
+    left = _scan_links(path)
+    if left:
+        raise OrchError("リンクが残っている: " + ", ".join(str(p) for p in left[:5]))
+    return removed
+
+
+def remove_worktree_safely(c: Ctx, repo_dir, wt, check: bool = True) -> None:
+    """リンクを外してから git worktree remove --force。"""
+    wt = Path(wt)
+    if wt.exists():
+        unlink_links(wt)
+    extra = {} if check else {"check": False}
+    git(c, repo_dir, "worktree", "remove", "--force", str(wt), **extra)
+
+
 def cleanup_task(c: Ctx, key: str, t: dict, keep: bool = False) -> None:
     if keep:
         update_task(c, key, cleanup="保持", cleanup_errors=[])
@@ -247,7 +298,7 @@ def cleanup_task(c: Ctx, key: str, t: dict, keep: bool = False) -> None:
     repo_dir = c.root / t["repo"]
     wt = Path(t["worktree"])
     try:
-        git(c, repo_dir, "worktree", "remove", "--force", str(wt))
+        remove_worktree_safely(c, repo_dir, wt)
     except OrchError as e:
         errors.append(str(e))
     if wt.exists():
@@ -2432,7 +2483,7 @@ def prepare_webchat(c: Ctx, repo: str, n: int) -> Path:
 def remove_webchat_worktree(c: Ctx, repo: str, n: int) -> None:
     repo_dir, wt = c.root / repo, webchat_worktree(c, repo, n)
     if wt.exists():
-        git(c, repo_dir, "worktree", "remove", "--force", str(wt), check=False)
+        remove_worktree_safely(c, repo_dir, wt, check=False)
         shutil.rmtree(wt, ignore_errors=True)
     git(c, repo_dir, "worktree", "prune", check=False)
     git(c, repo_dir, "branch", "-D", "webchat/%d" % n, check=False)
@@ -2542,6 +2593,82 @@ def cmd_webchat_reject(a) -> int:
     return 0
 
 
+# ---------- 作業場の作業ツリー ----------
+WS_LINK = "ac3ds-re"  # 作業ツリーの中に本体へのジャンクションを張るフォルダ
+
+
+def ws_worktree(c: Ctx, name: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9-]+", name or ""):
+        raise OrchError("名前は英数字と - だけ: %r" % name)
+    return c.data / "worktrees" / ("ws-" + name)
+
+
+def make_junction(link: Path, target: Path) -> None:
+    if os.name == "nt":
+        try:
+            import _winapi
+            _winapi.CreateJunction(str(target), str(link))
+            return
+        except (ImportError, OSError):
+            r = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True)
+            if r.returncode != 0:
+                raise OrchError("ジャンクションを作れない: %s" % (r.stderr or r.stdout).strip())
+    else:
+        os.symlink(target, link, target_is_directory=True)
+
+
+def cmd_ws_add(a) -> int:
+    c = Ctx()
+    wt = ws_worktree(c, a.name)
+    if wt.exists() or wt.is_symlink():
+        raise OrchError("既にある: %s" % wt)
+    git(c, c.root, "fetch", "origin")
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    git(c, c.root, "worktree", "add", "-b", a.branch, str(wt), "origin/main")
+    local = c.root / "workspace.local.toml"
+    if local.exists():
+        shutil.copy2(local, wt / local.name)
+    link, target = wt / WS_LINK, c.root / WS_LINK
+    if link.exists() or link.is_symlink():  # 追跡されたフォルダがあれば、中身を消さずに空の時だけ外す
+        unlink_links(link)
+        if link.is_dir():
+            link.rmdir()
+    make_junction(link, target)
+    print("作業ツリーを作った: %s（ブランチ %s）" % (wt, a.branch))
+    return 0
+
+
+def worktree_branch(c: Ctx, wt: Path) -> str:
+    return git(c, wt, "rev-parse", "--abbrev-ref", "HEAD").strip()
+
+
+def cmd_ws_remove(a) -> int:
+    c = Ctx()
+    wt = ws_worktree(c, a.name)
+    if not wt.exists():
+        raise OrchError("作業ツリーが無い: %s" % wt)
+    branch = worktree_branch(c, wt)
+    if not a.force:
+        # リンクの先（本体）の状態を拾わないよう、ac3ds-re のジャンクションは除いて見る
+        dirty = [l for l in git(c, wt, "status", "--porcelain", "--ignore-submodules").splitlines()
+                 if l[3:].strip('"').rstrip("/") != WS_LINK]
+        if dirty:
+            raise OrchError("未コミットの変更がある（--force で無視）:\n" + "\n".join(dirty[:10]))
+    remove_worktree_safely(c, c.root, wt)
+    if wt.exists():
+        try:
+            wt.rmdir()
+        except OSError:
+            pass
+    if not a.keep_branch and branch and branch != "HEAD":
+        git(c, c.root, "branch", "-D", branch, check=False)
+    if not (c.root / WS_LINK / ".git").exists():
+        print("!!!!!! 警告: 本体の %s/.git が無い。中身が消えた恐れ。すぐ確認する !!!!!!" % WS_LINK, file=sys.stderr)
+        return 1
+    print("作業ツリーを消した: %s" % wt)
+    return 0
+
+
 # ---------- 入口 ----------
 def main(argv=None) -> int:
     wslib.configure_stdio()
@@ -2646,6 +2773,17 @@ def main(argv=None) -> int:
     w = add_wc("reject", cmd_webchat_reject)
     w.add_argument("--reason", required=True)
     w.add_argument("--dry-run", action="store_true")
+    wsp = sub.add_parser("ws", help="作業場の作業ツリー（_local/worktrees/ws-<名前>）を作る・消す").add_subparsers(
+        dest="wscmd", required=True)
+    w = wsp.add_parser("add", help="origin/main から作業ツリーを作り、workspace.local.toml を写し、ac3ds-re を本体へのジャンクションで張る")
+    w.add_argument("name", help="英数字と - だけ")
+    w.add_argument("--branch", required=True, help="作るブランチ名")
+    w.set_defaults(f=cmd_ws_add)
+    w = wsp.add_parser("remove", help="ジャンクションを外してから作業ツリーとブランチを消す。未コミットの変更があれば断る")
+    w.add_argument("name")
+    w.add_argument("--force", action="store_true", help="未コミットの変更を無視する")
+    w.add_argument("--keep-branch", action="store_true", help="ローカルのブランチを残す")
+    w.set_defaults(f=cmd_ws_remove)
     a = p.parse_args(argv)
     try:
         return a.f(a)
