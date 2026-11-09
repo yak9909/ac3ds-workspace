@@ -1233,6 +1233,7 @@ def codex_unit(tmp_path, monkeypatch):
     monkeypatch.setattr(orch, "get_task", lambda *_: task)
     monkeypatch.setattr(orch, "update_task", lambda _c, _key, **fields: task.update(fields))
     monkeypatch.setattr(orch, "find_codex", lambda: "codex")
+    monkeypatch.setattr(orch, "git_launch_state", lambda *_: {"HEAD": "same"})
     return c, wt, task
 
 
@@ -1244,8 +1245,9 @@ def test_codex_resume_uses_last_log_and_message_file(codex_unit, monkeypatch, tm
     task["codex_log"] = str(previous)
     if with_idb:
         task["idb"] = {"path": str(tmp_path / "work.i64")}
-        states = iter([{"HEAD": "before"}, {"HEAD": "after"}])
-        monkeypatch.setattr(orch, "git_launch_state", lambda *_: next(states))
+    # IDB の有無に関係なく、Git の書き込みを見張る
+    states = iter([{"HEAD": "before"}, {"HEAD": "after"}])
+    monkeypatch.setattr(orch, "git_launch_state", lambda *_: next(states))
     message = tmp_path / "message.txt"
     message.write_text("続きの依頼\n", encoding="utf-8")
     fc = use_codex(monkeypatch, codex_jsonl("続きの返答"))
@@ -1258,8 +1260,7 @@ def test_codex_resume_uses_last_log_and_message_file(codex_unit, monkeypatch, tm
     assert "--dangerously-bypass-approvals-and-sandbox" in cmd
     assert not any("sandbox_workspace_write.writable_roots" in arg for arg in cmd)
     assert 'windows.sandbox="unelevated"' not in cmd
-    if with_idb:
-        assert "HEAD:" in task["git_violation"]
+    assert "HEAD:" in task["git_violation"]
     log = c.data / "logs" / "codex_ac3ds-re_5_1.jsonl"
     assert log.read_text(encoding="utf-8") == fc.out
     assert task["codex_log"] == str(log) and task["codex_finished_at"]

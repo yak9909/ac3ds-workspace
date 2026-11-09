@@ -1455,7 +1455,6 @@ def cmd_codex(a) -> int:
     wt = Path(t["worktree"])
     if not wt.is_dir():
         raise OrchError("作業ツリーが無い: %s" % wt)
-    idb = t.get("idb")
     cmd = codex_cmd(c, wt, find_codex(), model, effort, thread_id)
     if a.dry_run:
         print("dry-run: 実行しない。コマンド:")
@@ -1463,7 +1462,7 @@ def cmd_codex(a) -> int:
         print("依頼文（標準入力）: %s" % prompt_file)
         return 0
     log = next_log(c, a.repo, a.issue)
-    before = git_launch_state(c, wt) if idb else None
+    before = git_launch_state(c, wt)
     stopped = None
     try:
         try:
@@ -1472,11 +1471,10 @@ def cmd_codex(a) -> int:
             stopped = s
             code, out, err = s.code, s.stdout, s.stderr
     finally:
-        if before is not None:
-            violation = git_launch_violation(before, git_launch_state(c, wt))
-            if violation:
-                print("警告: ワーカーが Git に書き込んだ: %s" % violation)
-                update_task(c, key, git_violation=violation)
+        violation = git_launch_violation(before, git_launch_state(c, wt))
+        if violation:
+            print("警告: ワーカーが Git に書き込んだ: %s" % violation)
+            update_task(c, key, git_violation=violation)
     log.write_text(out, encoding="utf-8", newline="\n")
     update_task(c, key, codex_log=str(log), codex_finished_at=now())
     if stopped is not None:
