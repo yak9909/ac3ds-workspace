@@ -8,7 +8,6 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime
-import glob
 import hashlib
 import io
 import json
@@ -21,6 +20,7 @@ import subprocess
 import sys
 import time
 import tomllib
+import urllib.parse
 import uuid
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
@@ -58,11 +58,17 @@ CHECK_POLL_SEC = 15
 CHECK_APPEAR_SEC = 90  # push したコミットに検査が現れるまで待つ上限
 CHECK_TIMEOUT_SEC = 600
 
+LABEL_WEBCHAT = "webchat"  # WebChat が担当する Issue
+LABEL_BUSY = "作業中"  # ワーカーが取って作業している Issue（重複の防止）
+
 LABELS = (
     [(s, "1d76db", "スコープ") for s in SCOPES]
     + [(k, "5319e7", "種類") for k in KINDS]
     + [(d, "0e8a16", "難易度") for d in DIFFS]
+    + [(LABEL_WEBCHAT, "fbca04", "WebChat が担当"), (LABEL_BUSY, "d93f0b", "ワーカーが作業中")]
 )
+WEBCHAT_MODEL = "gpt-6-sol"  # WebChat のモデル名（kb.py intake --by に渡す）
+WEBCHAT_INBOX = "inbox/webchat"  # WebChat の記録の下書きの置き場（解析リポジトリの中）
 
 
 class OrchError(Exception):
@@ -414,6 +420,18 @@ def pr_number(out: str):
     return int(m.group(1)) if m else None
 
 
+def set_label(c: Ctx, repo: str, n, name: str, on: bool) -> None:
+    """Issue のラベルを付ける/外す。失敗は警告にとどめ、本処理は止めない。"""
+    try:
+        gh_run(["issue", "edit", str(n), "--repo", repo_slug(c, repo), "--add-label" if on else "--remove-label", name])
+    except OrchError as e:
+        print("警告: Issue #%s のラベル「%s」を%sけられなかった: %s" % (n, name, "付" if on else "外", e))
+
+
+def label_names(issue: dict) -> set[str]:
+    return {lb.get("name") for lb in issue.get("labels", [])}
+
+
 # ---------- setup-github ----------
 def cmd_setup_github(a) -> int:
     c = Ctx()
@@ -440,7 +458,7 @@ def cmd_setup_github(a) -> int:
     for name, color, desc in LABELS:
         body = json.dumps({"name": name, "color": color, "description": desc})
         if name in existing:
-            gh_run(["api", "-X", "PATCH", "repos/%s/labels/%s" % (slug, name), "--input", "-"], body)
+            gh_run(["api", "-X", "PATCH", "repos/%s/labels/%s" % (slug, urllib.parse.quote(name)), "--input", "-"], body)
         else:
             gh_run(["api", "-X", "POST", "repos/%s/labels" % slug, "--input", "-"], body)
     gh_run(["api", "-X", "PUT", "repos/%s/branches/main/protection" % slug, "--input", "-"], json.dumps(prot))
@@ -880,9 +898,22 @@ def analysis_leaks(c: Ctx, text: str) -> list[str]:
     return sorted(found)
 
 
+def webchat_section() -> str:
+    return ("### WebChat への指示\n\n"
+            "- この Issue を取る時に、ラベル「%s」を付ける。\n"
+            "- 記録の下書きは `%s/<この Issue の番号>/<連番>.md` に置く（連番は 01, 02, ... ）。"
+            "ID は書かない（司令塔が振る）。\n"
+            "- ブランチ `webchat/<この Issue の番号>` から PR を出し、PR 本文の先頭に `Issue #<この Issue の番号>` と書く。"
+            "PR の差分は `%s/<この Issue の番号>/` の中だけにする。\n"
+            "- 上の「対象」「関係する資料」の関数名・番地・既存の記録の ID を手掛かりにする。\n") % (
+                LABEL_BUSY, WEBCHAT_INBOX, WEBCHAT_INBOX)
+
+
 def cmd_issue(a) -> int:
     c = Ctx()
     role = need_repo(c, a.repo).get("role", "analysis")
+    if a.webchat and (role != "analysis" or a.repo != DEFAULT_REPO):
+        raise OrchError("--webchat は解析リポジトリ（%s）の Issue だけで使える" % DEFAULT_REPO)
     for k in ("title", "goal", "target", "materials"):
         if not (getattr(a, k) or "").strip():
             raise OrchError("必須項目が空: --%s" % k)
@@ -891,17 +922,22 @@ def cmd_issue(a) -> int:
     if not title.startswith(pre):
         title = "%s %s" % (pre, title)
     body = issue_body(a.scope, a.kind, a.difficulty, a.goal, a.target, a.materials)
+    if a.webchat:
+        body += "\n" + webchat_section()
     if role == "derived":
         leaks = analysis_leaks(c, title + "\n" + body)
         if leaks:
             raise OrchError("派生リポジトリの Issue に解析の情報を書かない: %s" % ", ".join(leaks))
     outgoing(title, body)
     args = ["issue", "create", "--repo", repo_slug(c, a.repo), "--title", title, "--body", body]
-    for lb in (a.scope, a.kind, a.difficulty):
+    for lb in (a.scope, a.kind, a.difficulty, *([LABEL_WEBCHAT] if a.webchat else [])):
         args += ["--label", lb]
     out = gh_run(args)
     number = pr_number(out)
     print("Issue を作成: #%s %s" % (number, title))
+    if a.webchat:
+        print("WebChat に渡す。PR が出たら: python scripts/orch.py webchat verify <PR の番号>")
+        return 0
     repo_option = " --repo %s" % a.repo if a.repo != DEFAULT_REPO else ""
     print("次の依頼: python scripts/orch.py dispatch %s --worker ...%s" % (number, repo_option))
     return 0
@@ -1036,6 +1072,12 @@ def cmd_dispatch(a) -> int:
     issue = read_issue(c, a.repo, a.issue)
     if issue.get("state") != "OPEN":
         raise OrchError("Issue #%s は開いていない。開いた Issue の番号を指定する" % a.issue)
+    labels = label_names(issue)
+    if LABEL_WEBCHAT in labels:
+        raise OrchError("Issue #%s にはラベル「%s」が付いている（WebChat の担当）。ワーカーには依頼しない" % (a.issue, LABEL_WEBCHAT))
+    prior = load_tasks(c).get(tkey(a.repo, a.issue))
+    if LABEL_BUSY in labels and not (prior and prior.get("state") in ACTIVE):
+        raise OrchError("Issue #%s にはラベル「%s」が付いている（別のワーカーが作業中）。依頼しない" % (a.issue, LABEL_BUSY))
     sec = parse_sections(issue.get("body", ""))
     scope = sec.get("スコープ", "").strip()
     if scope not in SCOPES:
@@ -1113,6 +1155,8 @@ def cmd_dispatch(a) -> int:
                 dispatched_at=now(), usage_before=usage, body=issue.get("body", ""),
                 stamped_head=None, outside_before=outside_before, ignore_limit_reason=ignore or None,
                 ignored_limits=ignored)
+    if LABEL_BUSY not in labels:
+        set_label(c, a.repo, a.issue, LABEL_BUSY, True)
     print(text)
     print("--- 依頼文を保存: %s（ブランチ %s、%s %s）" % (out, branch, a.worker, a.effort or w.get("default_effort")))
     return 0
@@ -1278,13 +1322,9 @@ def find_codex() -> str:
     return exe
 
 
-def evidence_dir(c: Ctx, repo: str, issue: int) -> Path:
-    name = str(issue) if repo == DEFAULT_REPO else "%s-%s" % (repo, issue)
-    return c.data / "evidence" / name
-
-
-def codex_cmd(c: Ctx, wt: Path, exe: str, model: str, effort: str, idb_path: str | None = None,
-              evidence: Path | None = None, thread_id: str | None = None) -> list[str]:
+def codex_cmd(c: Ctx, wt: Path, exe: str, model: str, effort: str, thread_id: str | None = None) -> list[str]:
+    """Codex の起動コマンド。砂場は使わず、常に全権限で起動する（2026-11-09 の利用者の方針。
+    砂場では MSYS が止まり make が通らない）。"""
     python = str((c.root / "_local/venv/tools/Scripts/python.exe").resolve())
     guard = str((c.root / "scripts/usage_guard.py").resolve())
     command = subprocess.list2cmdline([python, guard, "--provider", "codex"])
@@ -1292,34 +1332,9 @@ def codex_cmd(c: Ctx, wt: Path, exe: str, model: str, effort: str, idb_path: str
             + json.dumps(command, ensure_ascii=False) + ',timeout=10}]}]')
     # 既存の資料をワーカーが自分で探せるよう、ウェブ検索を有効にする。
     hook_args = ["--dangerously-bypass-hook-trust", "-c", hook, "-c", 'web_search="live"']
-    if thread_id:
-        cmd = [exe, "exec", "resume", thread_id]
-        if idb_path:
-            cmd += ["--dangerously-bypass-approvals-and-sandbox"]
-        else:
-            if os.name == "nt":
-                cmd += ["-c", 'windows.sandbox="unelevated"']
-            roots = [str(c.state), str(evidence)]
-            cmd += ["-c", "sandbox_workspace_write.writable_roots=" + json.dumps(roots, ensure_ascii=False)]
-        return cmd + hook_args + ["-m", model, "-c", 'model_reasoning_effort="%s"' % effort, "--json", "-"]
-    cmd = [exe, "exec", "-C", str(wt)]
-    if idb_path:
-        cmd += ["--dangerously-bypass-approvals-and-sandbox"]
-    else:
-        cmd += ["-s", "workspace-write"]
-        if os.name == "nt":
-            cmd += ["-c", 'windows.sandbox="unelevated"']
-        cmd += ["--add-dir", str(c.state)]
-        cmd += ["--add-dir", str(evidence)]
+    cmd = [exe, "exec", "resume", thread_id] if thread_id else [exe, "exec", "-C", str(wt)]
+    cmd += ["--dangerously-bypass-approvals-and-sandbox"]
     return cmd + hook_args + ["-m", model, "-c", 'model_reasoning_effort="%s"' % effort, "--json", "-"]
-
-
-def real_pwsh_dir() -> str | None:
-    """ストア版 PowerShell の実体のフォルダ（新しい版）。PATH 上の実行エイリアスは、
-    Codex のサンドボックス（制限付きのトークン）からは起動できない（CreateProcessAsUserW の 5）。"""
-    found = glob.glob(r"C:\Program Files\WindowsApps\Microsoft.PowerShell_*_x64__*\pwsh.exe") if os.name == "nt" else []
-    ver = lambda p: [int(x) for x in re.findall(r"\d+", Path(p).parent.name.split("_")[1])]
-    return str(Path(max(found, key=ver)).parent) if found else None
 
 
 CODEX_STOPPED_RC = 3  # 利用枠の上限で Codex を止めたときの終了コード（続きは --resume）
@@ -1339,11 +1354,7 @@ class CodexStopped(OrchError):
 def run_codex(c: Ctx, cmd: list[str], cwd: Path, prompt: str) -> tuple[int, str, str]:
     """codex を起動し、終わるまで待つ。実行中は利用枠を見張り、閾値以上なら止めて CodexStopped を投げる。
     試験ではこの関数を差し替える。"""
-    env = child_env(c)
-    d = real_pwsh_dir()
-    if d:
-        env["PATH"] = d + os.pathsep + env.get("PATH", "")
-    r = usage_watch.run_with_guard(cmd, input_text=prompt, cwd=str(cwd), env=env, root=c.root, provider="codex")
+    r = usage_watch.run_with_guard(cmd, input_text=prompt, cwd=str(cwd), env=child_env(c), root=c.root, provider="codex")
     if r.stopped:
         raise CodexStopped(r.used_percent, r.returncode, r.stdout, r.stderr)
     return r.returncode, r.stdout, r.stderr
@@ -1444,20 +1455,14 @@ def cmd_codex(a) -> int:
     wt = Path(t["worktree"])
     if not wt.is_dir():
         raise OrchError("作業ツリーが無い: %s" % wt)
-    idb = t.get("idb")
-    evidence = evidence_dir(c, a.repo, a.issue)
-    if not idb and not a.dry_run:
-        evidence.mkdir(parents=True, exist_ok=True)
-    cmd = codex_cmd(c, wt, find_codex(), model, effort, idb["path"] if idb else None, evidence, thread_id)
+    cmd = codex_cmd(c, wt, find_codex(), model, effort, thread_id)
     if a.dry_run:
         print("dry-run: 実行しない。コマンド:")
-        if idb:
-            print("サンドボックス無し（IDA を使うタスク）")
         print(subprocess.list2cmdline(cmd))
         print("依頼文（標準入力）: %s" % prompt_file)
         return 0
     log = next_log(c, a.repo, a.issue)
-    before = git_launch_state(c, wt) if idb else None
+    before = git_launch_state(c, wt)
     stopped = None
     try:
         try:
@@ -1466,11 +1471,10 @@ def cmd_codex(a) -> int:
             stopped = s
             code, out, err = s.code, s.stdout, s.stderr
     finally:
-        if before is not None:
-            violation = git_launch_violation(before, git_launch_state(c, wt))
-            if violation:
-                print("警告: ワーカーが Git に書き込んだ: %s" % violation)
-                update_task(c, key, git_violation=violation)
+        violation = git_launch_violation(before, git_launch_state(c, wt))
+        if violation:
+            print("警告: ワーカーが Git に書き込んだ: %s" % violation)
+            update_task(c, key, git_violation=violation)
     log.write_text(out, encoding="utf-8", newline="\n")
     update_task(c, key, codex_log=str(log), codex_finished_at=now())
     if stopped is not None:
@@ -2196,6 +2200,7 @@ def cmd_accept(a) -> int:
         git(c, repo_dir, "merge", "--ff-only", "origin/main")
     else:
         print("警告: 手元の %s が main でないので更新しない" % a.repo)
+    set_label(c, a.repo, a.issue, LABEL_BUSY, False)
     imp = import_canonical(c, t, short) if t.get("symbols_builds") else "不要"
     update_task(c, key, state="accepted", accepted_at=now(), scores=scores, idb_import=imp, merge_commit=short,
                 usage_after=read_usage(c))
@@ -2226,6 +2231,7 @@ def cmd_reject(a) -> int:
         slug = repo_slug(c, a.repo)
         gh_run(["pr", "comment", str(t["pr"]), "--repo", slug, "--body", comment])
         gh_run(["pr", "close", str(t["pr"]), "--repo", slug, "--delete-branch"])
+    set_label(c, a.repo, a.issue, LABEL_BUSY, False)
     update_task(c, key, state="rejected", rejected_at=now(), reject_reason=a.reason, usage_after=read_usage(c))
     cleanup_task(c, key, t, a.keep)
     print("%s: 却下" % key)
@@ -2308,6 +2314,11 @@ def run_verify_command(c: Ctx, wt: Path, command: str, files: list[str]) -> tupl
     return r.returncode, (r.stdout or "") + (r.stderr or "")
 
 
+def verify_results(c: Ctx, wt: Path, commands: list[str], base: str) -> list[tuple[str, int, str]]:
+    files = verify_files(c, wt, base)
+    return [(command, *run_verify_command(c, wt, command, files)) for command in commands]
+
+
 def cmd_verify(a) -> int:
     """作業ツリーでビルドと試験を LLM なしで走らせ、結果と差分を 1 つのファイルにまとめる（accept の前提にはしない）。"""
     c = Ctx()
@@ -2321,11 +2332,7 @@ def cmd_verify(a) -> int:
     if not commands:
         raise OrchError("workspace.toml の repos.%s に verify が無い" % a.repo)
     base = base_ref(c, wt)
-    files = verify_files(c, wt, base)
-    results = []
-    for command in commands:
-        rc, out = run_verify_command(c, wt, command, files)
-        results.append((command, rc, out))
+    results = verify_results(c, wt, commands, base)
     mb = git(c, wt, "merge-base", base, "HEAD", check=False).strip() or base
     parts = ["# 機械の検証 %s#%s\n" % (a.repo, a.issue), "## コマンドの結果\n"]
     for command, rc, out in results:
@@ -2349,11 +2356,205 @@ def cmd_verify(a) -> int:
     return 0 if ok else 1
 
 
+# ---------- WebChat ----------
+# WebChat（ChatGPT の Web 画面。利用者が手で操作する）は、台帳に載らない。Issue #N のラベル webchat で担当を示し、
+# 下書きを inbox/webchat/N/ に置いて、ブランチ webchat/N から PR を出す。取り込みは PR 単位で行う。
+def webchat_issue_number(body: str, branch: str) -> int:
+    """PR 本文の先頭の `Issue #N` とブランチ名 `webchat/N` から Issue 番号を取る。両方あって食い違えば断る。"""
+    m = re.match(r"\s*Issue\s*#(\d+)", body or "")
+    b = re.fullmatch(r"webchat/(\d+)", branch or "")
+    from_body, from_branch = (int(m.group(1)) if m else None), (int(b.group(1)) if b else None)
+    if from_body is not None and from_branch is not None and from_body != from_branch:
+        raise OrchError("PR 本文の Issue #%d とブランチ %s が食い違う" % (from_body, branch))
+    n = from_body if from_body is not None else from_branch
+    if n is None:
+        raise OrchError("Issue 番号が分からない（PR 本文の先頭に `Issue #N` か、ブランチ名 `webchat/N` が要る）")
+    return n
+
+
+def webchat_outside(paths: list[str], n: int) -> list[str]:
+    """PR の差分のうち、inbox/webchat/<N>/ の外にある物。"""
+    prefix = "%s/%d/" % (WEBCHAT_INBOX, n)
+    return [x for x in paths if not x.startswith(prefix)]
+
+
+def read_webchat_pr(c: Ctx, repo: str, pr) -> tuple[dict, int]:
+    """PR を読み、（情報、Issue 番号）を返す。開いていない PR、フォークからの PR、受け箱の外に及ぶ PR は断る。"""
+    out = gh_run(["pr", "view", str(pr), "--repo", repo_slug(c, repo),
+                  "--json", "number,state,body,headRefName,isDraft,isCrossRepository,files"])
+    try:
+        info = json.loads(out)
+    except ValueError:
+        raise OrchError("PR #%s の読み取り結果が JSON でない" % pr)
+    if info.get("state") != "OPEN":
+        raise OrchError("PR #%s は開いていない（%s）" % (pr, info.get("state")))
+    if info.get("isCrossRepository"):
+        raise OrchError("PR #%s はフォークからの PR。同じリポジトリのブランチから出してもらう" % pr)
+    n = webchat_issue_number(info.get("body") or "", info.get("headRefName") or "")
+    if info.get("headRefName") != "webchat/%d" % n:
+        raise OrchError("ブランチが webchat/%d でない（%s）" % (n, info.get("headRefName")))
+    paths = [f.get("path", "") for f in info.get("files") or []]
+    if not paths:
+        raise OrchError("PR #%s に差分のファイルが無い" % pr)
+    outside = webchat_outside(paths, n)
+    if outside:
+        raise OrchError("PR #%s の差分が %s/%d/ の外に及ぶ: %s" % (pr, WEBCHAT_INBOX, n, ", ".join(outside[:5])))
+    return info, n
+
+
+def webchat_worktree(c: Ctx, repo: str, n: int) -> Path:
+    return c.data / "worktrees" / repo / ("webchat-%d" % n)
+
+
+def prepare_webchat(c: Ctx, repo: str, n: int) -> Path:
+    """PR のブランチを作業ツリーに取り出し、origin/main に追いつかせる。追いついた後の差分が受け箱の外なら断る。"""
+    repo_dir = c.root / repo
+    branch = "webchat/%d" % n
+    wt = webchat_worktree(c, repo, n)
+    git(c, repo_dir, "fetch", "origin")
+    if wt.exists():
+        git(c, wt, "checkout", "-q", "--detach")  # 取り出し直す前にブランチを空ける
+    else:
+        wt.parent.mkdir(parents=True, exist_ok=True)
+        git(c, repo_dir, "worktree", "add", "--detach", str(wt), "origin/" + branch)
+    git(c, wt, "checkout", "-q", "-B", branch, "origin/" + branch)
+    mr = subprocess.run([c.git, "merge", "origin/main", "-m", "main を取り込み"], cwd=str(wt), capture_output=True,
+                        text=True, env=tool_env(c))
+    if mr.returncode != 0:
+        subprocess.run([c.git, "merge", "--abort"], cwd=str(wt), capture_output=True, env=tool_env(c))
+        raise OrchError("main の取り込みで衝突。WebChat に直してもらう:\n" + (mr.stdout + mr.stderr).strip()[-300:])
+    outside = webchat_outside(git(c, wt, "diff", "--name-only", "origin/main", "HEAD").splitlines(), n)
+    if outside:
+        raise OrchError("ブランチの差分が %s/%d/ の外に及ぶ: %s" % (WEBCHAT_INBOX, n, ", ".join(outside[:5])))
+    return wt
+
+
+def remove_webchat_worktree(c: Ctx, repo: str, n: int) -> None:
+    repo_dir, wt = c.root / repo, webchat_worktree(c, repo, n)
+    if wt.exists():
+        git(c, repo_dir, "worktree", "remove", "--force", str(wt), check=False)
+        shutil.rmtree(wt, ignore_errors=True)
+    git(c, repo_dir, "worktree", "prune", check=False)
+    git(c, repo_dir, "branch", "-D", "webchat/%d" % n, check=False)
+
+
+def run_webchat_verify(c: Ctx, repo: str, wt: Path, n: int) -> bool:
+    commands = (c.ws.get("repos", {}).get(repo) or {}).get("verify") or []
+    if not commands:
+        raise OrchError("workspace.toml の repos.%s に verify が無い" % repo)
+    results = verify_results(c, wt, commands, "origin/main")
+    for command, rc, out in results:
+        print("%s  %s（終了コード %d）" % ("合格" if rc == 0 else "不合格", command, rc))
+        if rc != 0:
+            print("\n".join(out.splitlines()[-20:]))
+    ok = all(rc == 0 for _, rc, _ in results)
+    print("機械の検証: %s" % ("合格" if ok else "不合格"))
+    drafts = sorted(p.name for p in (wt / WEBCHAT_INBOX / str(n)).glob("*.md"))
+    print("下書き（%d 件）: %s" % (len(drafts), wt / WEBCHAT_INBOX / str(n)))
+    for d in drafts:
+        print("  - " + d)
+    return ok
+
+
+def cmd_webchat_verify(a) -> int:
+    c = Ctx()
+    need_repo(c, a.repo)
+    info, n = read_webchat_pr(c, a.repo, a.pr)
+    wt = prepare_webchat(c, a.repo, n)
+    print("PR #%s（Issue #%d）を作業ツリーに取り出した: %s" % (a.pr, n, wt))
+    return 0 if run_webchat_verify(c, a.repo, wt, n) else 1
+
+
+def cmd_webchat_accept(a) -> int:
+    c = Ctx()
+    role = need_repo(c, a.repo).get("role", "analysis")
+    scores = parse_scores(a.scores)
+    check_scores(scores, role, pass_min(c))
+    read = read_source(a.read).strip()
+    if len([line for line in read.splitlines() if line.strip()]) < 2:
+        raise OrchError("読んだ物は 2 つ以上書く（報告だけで採点しない）")
+    info, n = read_webchat_pr(c, a.repo, a.pr)
+    slug = repo_slug(c, a.repo)
+    comment = "合格\n\n採点: " + ", ".join("%s=%g" % kv for kv in scores.items())
+    comment += "\n\n採点の前に読んだ物:\n\n" + read
+    if a.dry_run:
+        print("dry-run: 次を行う（何も書かない）")
+        for step in ("PR のブランチを作業ツリーに取り出し、origin/main を取り込み", "機械の検証（workspace.toml の verify）",
+                     "kb.py intake --issue %d --by %s（ID を振って findings へ移す）" % (n, WEBCHAT_MODEL),
+                     "結果をコミットして push", "PR #%s にコメント「%s」" % (a.pr, comment.replace("\n", " ")),
+                     "検査が揃うのを待ち、PUT pulls/%s/merge で取り込み" % a.pr,
+                     "Issue #%d の「%s」を外して閉じる" % (n, LABEL_BUSY), "作業ツリーを片付ける"):
+            print("  - " + step)
+        return 0
+    outgoing(comment)
+    wt = prepare_webchat(c, a.repo, n)
+    if not run_webchat_verify(c, a.repo, wt, n):
+        raise OrchError("機械の検証が不合格。取り込まない")
+    kb = wt / "tools" / "kb.py"
+    code, out = run_py(c, wt, kb, ["intake", "--issue", str(n), "--by", WEBCHAT_MODEL])
+    if code != 0:
+        raise OrchError("kb.py intake が失敗（何も書かれていない）:\n" + out[-600:])
+    ids = [x.strip() for x in out.splitlines() if re.fullmatch(r"[A-Za-z0-9]+-F\d+", x.strip())]
+    code, out = run_py(c, wt, kb, ["lint"])
+    if code != 0:
+        raise OrchError("intake の後の lint が失敗:\n" + out[-400:])
+    commit_all(c, wt, "WebChat の記録を取り込む（Issue #%d）" % n)
+    git(c, wt, "push", "origin", "webchat/%d" % n)
+    sha = head(c, wt)
+    gh_run(["pr", "comment", str(a.pr), "--repo", slug, "--body", comment])
+    if info.get("isDraft"):
+        gh_run(["pr", "ready", str(a.pr), "--repo", slug])
+    wait_checks(c, slug, a.pr, sha)
+    gh_run(["api", "-X", "PUT", "repos/%s/pulls/%s/merge" % (slug, a.pr), "-f", "merge_method=merge"])
+    repo_dir = c.root / a.repo
+    git(c, repo_dir, "fetch", "origin")
+    if git(c, repo_dir, "rev-parse", "--abbrev-ref", "HEAD").strip() == "main":
+        git(c, repo_dir, "merge", "--ff-only", "origin/main")
+    else:
+        print("警告: 手元の %s が main でないので更新しない" % a.repo)
+    set_label(c, a.repo, n, LABEL_BUSY, False)
+    try:
+        gh_run(["issue", "close", str(n), "--repo", slug])
+    except OrchError as e:
+        print("警告: Issue #%d を閉じられなかった: %s" % (n, e))
+    if not a.keep:
+        remove_webchat_worktree(c, a.repo, n)
+    print("webchat PR #%s（Issue #%d）: 取り込み完了。振った ID: %s" % (a.pr, n, ", ".join(ids) or "（出力から読み取れなかった）"))
+    return 0
+
+
+def cmd_webchat_reject(a) -> int:
+    c = Ctx()
+    need_repo(c, a.repo)
+    info, n = read_webchat_pr(c, a.repo, a.pr)
+    comment = "却下: " + a.reason
+    if a.dry_run:
+        print("dry-run: PR #%s にコメント「%s」→ 閉じる（ブランチ削除）→ Issue #%d の「%s」を外す（Issue は閉じない）" % (
+            a.pr, comment, n, LABEL_BUSY))
+        return 0
+    outgoing(comment)
+    slug = repo_slug(c, a.repo)
+    gh_run(["pr", "comment", str(a.pr), "--repo", slug, "--body", comment])
+    gh_run(["pr", "close", str(a.pr), "--repo", slug, "--delete-branch"])
+    set_label(c, a.repo, n, LABEL_BUSY, False)
+    remove_webchat_worktree(c, a.repo, n)
+    print("webchat PR #%s（Issue #%d）: 却下" % (a.pr, n))
+    return 0
+
+
 # ---------- 入口 ----------
 def main(argv=None) -> int:
     wslib.configure_stdio()
     p = argparse.ArgumentParser(prog="orch.py")
     sub = p.add_subparsers(dest="cmd", required=True)
+    wc = sub.add_parser("webchat", help="WebChat の PR（台帳に載らない）を取り込む").add_subparsers(dest="wcmd", required=True)
+
+    def add_wc(name, f):
+        w = wc.add_parser(name)
+        w.add_argument("pr", type=int)
+        w.add_argument("--repo", default=DEFAULT_REPO)
+        w.set_defaults(f=f)
+        return w
 
     def add(name, f, repo=True, dry=False):
         s = sub.add_parser(name)
@@ -2382,6 +2583,7 @@ def main(argv=None) -> int:
     s.add_argument("--difficulty", required=True, choices=DIFFS)
     for k in ("title", "goal", "target", "materials"):
         s.add_argument("--" + k, required=True)
+    s.add_argument("--webchat", action="store_true", help="WebChat に渡す Issue にする（ラベル webchat、WebChat への指示を本文に足す）")
     s = add("consolidate-check", cmd_consolidate_check)
     s.add_argument("--create", action="store_true")
     s.add_argument("--threshold", type=int)
@@ -2435,6 +2637,15 @@ def main(argv=None) -> int:
     s.add_argument("issue", type=int)
     s.add_argument("--reason", required=True)
     s.add_argument("--keep", action="store_true")
+    add_wc("verify", cmd_webchat_verify)
+    w = add_wc("accept", cmd_webchat_accept)
+    w.add_argument("--scores", required=True)
+    w.add_argument("--read", required=True, help="採点の前に読んだ物の一覧のファイル（- は標準入力）。PR のコメントに残す")
+    w.add_argument("--dry-run", action="store_true")
+    w.add_argument("--keep", action="store_true")
+    w = add_wc("reject", cmd_webchat_reject)
+    w.add_argument("--reason", required=True)
+    w.add_argument("--dry-run", action="store_true")
     a = p.parse_args(argv)
     try:
         return a.f(a)

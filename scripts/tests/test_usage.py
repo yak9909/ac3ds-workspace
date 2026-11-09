@@ -249,12 +249,10 @@ def test_threshold_config_and_override(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("resume", [None, "thread-1"])
-@pytest.mark.parametrize("idb", [None, "work.i64"])
-def test_codex_hook_toml(resume, idb):
+def test_codex_hook_toml(resume):
     root = (Path(__file__).resolve().parent / "workspace with spaces 日本語").resolve()
     ctx = SimpleNamespace(root=root, state=root / "_local/state")
-    cmd = orch.codex_cmd(ctx, root / "worktree", "codex", "model", "medium", idb,
-                         root / "evidence", resume)
+    cmd = orch.codex_cmd(ctx, root / "worktree", "codex", "model", "medium", resume)
     assert "--dangerously-bypass-hook-trust" in cmd
     config = {}
     for index, arg in enumerate(cmd[:-1]):
