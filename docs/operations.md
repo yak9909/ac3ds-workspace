@@ -98,6 +98,7 @@ ac3ds-workspace/   作業場。司令塔はここで起動する
 | ワーカーの格付け | 差分に加えて確かめる物 |
 |---|---|
 | C・?（Haiku など） | 根拠を一次証拠で全部確かめる。解析の記録は A 以上の確認が要る |
+| B（gpt-6-sol など） | A と同じ。ただし `hard` を担当した時（WebChat）は、C・? と同じく根拠を全部確かめる |
 | A（Sonnet など） | 結論に効く根拠を一次証拠で確かめる |
 | S（Opus） | 抜き取りで確かめる |
 
@@ -145,7 +146,7 @@ ac3ds-workspace/   作業場。司令塔はここで起動する
 
 - **Codex と Claude のどちらを優先するかは決めません。** 週の枠などの状況を見て、利用者がその都度指示します。指示が無い間は、直前の指示を続けます。
 - 格付けは `ac3ds-re/meta/models.toml` にあり、利用者が管理します。S は Opus 5.5、A は Sonnet 5.5・gpt-6.1-sol・gpt-6-astra、B は opus-5・gpt-sol-5.6・gpt-6-sol、C は Haiku 5.5・gpt-6-luna、? は gpt-6・unknown です。
-- `hard` は A 以上、`normal` は B 以上、`easy` は誰でも担当できます。
+- `hard` は A 以上、`normal` は B 以上、`easy` は誰でも担当できます。例外として、WebChat（格付け B のモデルしか使えない）は `hard` も担当します。その結果は 5.3 の C・? と同じ深さで確かめます（2026-11-09 利用者の決定）。
 - Codex は砂場を使わず全権限で起動する（2026-11-09 の利用者の方針。砂場では MSYS が止まり make が通らない）。
 
 | 作業 | Claude の場合 | effort の既定 |
@@ -234,7 +235,7 @@ WebChat は ChatGPT の Web 画面で、利用者が手で操作します。台�
 - **受け箱**: WebChat は記録の下書きを `inbox/webchat/<Issue 番号>/<連番>.md` に置き、ブランチ `webchat/<Issue 番号>` から PR を出します。PR 本文の先頭は `Issue #N` です。PR の差分が受け箱の外に及ぶ物は取り込みません。
 - **取り込み**: `orch.py webchat verify <PR>`（ブランチを作業ツリーに取り出し、main に追いつかせ、機械の検証を走らせる）、`webchat accept <PR> --scores ... --read <ファイル>`（検証の後に `kb.py intake --issue N --by gpt-6-sol` で ID を振り、結果を push して PR にコメントし、取り込む。Issue は閉じる）、`webchat reject <PR> --reason ...`（PR を閉じる。Issue は開いたまま）です。採点表は解析の物を使います。
 - **直しの依頼**: 利用者が、開いている WebChat の PR に直しを頼むことがあります。WebChat は同じブランチに push し、PR に「利用者の指示」と直した報告をコメントします（手順書 9 節）。直しのコメントの後に、利用者から「終わった」と伝わるまで `webchat verify` に進みません。取り込み済みの PR は直さず、新しい Issue と `supersedes:` つきの下書きで訂正します。打ち切った PR は、同じ Issue でやり直します。
-- **利用者の実機での観察**: 利用者がその場で実機を確かめ、結果を WebChat に伝えることがあります。WebChat は、それを下書きの根拠の「利用者の実機での観察」に書き、確度は MEDIUM までにします（手順書 10 節）。WebChat は証拠のファイルを残せないためです。HIGH に上げるかは取り込みの時に司令塔が決めます。上げる時は、利用者に証拠（画像・値）を `_local/evidence/<Issue 番号>/` に置いてもらい、記録にパスと SHA256 を書きます。
+- **利用者の実機での観察**: 利用者がその場で実機を確かめ、結果を WebChat に伝えることがあります。WebChat は、それを下書きの根拠の「利用者の実機での観察」に書き、確度は MEDIUM までにします（手順書 10 節）。WebChat は証拠のファイルを残せないためです。HIGH に上げる時は、利用者に証拠（画像・値）を `_local/evidence/<Issue 番号>/` に置いてもらい、5.3 のとおり深い検証に回してから、新しい記録（`supersedes:` つき。パスと SHA256 を書く）で上げます。
 - **始める時（1 回だけ）**: `orch.py setup-github ac3ds-re` でラベルを作り、利用者が手順書を ChatGPT のプロジェクトに貼ります（2026-11-09 に済み）。
 
 ### 12.2 作業場（ac3ds-workspace）の変更
