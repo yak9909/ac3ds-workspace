@@ -13,7 +13,7 @@ IS_WIN = os.name == "nt"
 
 
 def run(cwd, *args):
-    subprocess.run([GIT, "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args], cwd=str(cwd),
+    subprocess.run([GIT, "-c", "user.name=t", "-c", "user.email=t@example.com", *args], cwd=str(cwd),
                    check=True, capture_output=True)
 
 
