@@ -233,6 +233,16 @@ WebChat は ChatGPT の Web 画面で、利用者が手で操作します。台�
 - **依頼**: `orch.py issue --webchat ...`（解析リポジトリだけ）で、ラベル `webchat` と WebChat への指示を付けた Issue を作ります。
 - **受け箱**: WebChat は記録の下書きを `inbox/webchat/<Issue 番号>/<連番>.md` に置き、ブランチ `webchat/<Issue 番号>` から PR を出します。PR 本文の先頭は `Issue #N` です。PR の差分が受け箱の外に及ぶ物は取り込みません。
 - **取り込み**: `orch.py webchat verify <PR>`（ブランチを作業ツリーに取り出し、main に追いつかせ、機械の検証を走らせる）、`webchat accept <PR> --scores ... --read <ファイル>`（検証の後に `kb.py intake --issue N --by gpt-6-sol` で ID を振り、結果を push して PR にコメントし、取り込む。Issue は閉じる）、`webchat reject <PR> --reason ...`（PR を閉じる。Issue は開いたまま）です。採点表は解析の物を使います。
+- **始める時（1 回だけ）**: `orch.py setup-github ac3ds-re` でラベルを作り、利用者が手順書を ChatGPT のプロジェクトに貼ります（2026-11-09 に済み）。
+
+### 12.2 作業場（ac3ds-workspace）の変更
+
+`orch.py` の依頼先に作業場はありません。道具の変更は、道具のワーカー（Agent ツールの `tooling`）に作業場の作業ツリーで頼みます。
+
+- **作業ツリー**: `workspace.local.toml` の `git`（`C:/Program Files/Git/cmd/git.exe`）で `_local/worktrees/ws-<名前>` に作り、`workspace.local.toml` を写して、`ac3ds-re` をジャンクションで張ります。PATH の先頭の `git` は devkitPro の msys2 の物で、これで作ると `.git` が msys 形式のパスになり Git Bash から使えません。`workspace.local.toml` が無いと道具と試験もその git を使い、`scripts/tests` の stamp・accept の試験が `audit` の CRLF で落ちます。
+- **採点**: 司令塔が差分を読み、作業ツリーで `scripts/tests` を走らせます（全体で 20 分ほど。裏で走らせる）。
+- **取り込み**: main は保護され、監査の CI（`audit`）が必須です。push → `gh pr create` → `gh pr checks <n> --watch` → `gh api -X PUT repos/yak9909/ac3ds-workspace/pulls/<n>/merge -f merge_method=merge`（`gh pr merge --delete-branch` はこの環境で止まる）→ 本体で `git pull --ff-only` し、作業ツリーとブランチを消します。
+- **ラベルを足した時**: `orch.py setup-github <リポジトリ>`（リポジトリは位置引数）。リポジトリの設定・ラベル・main の保護を書き直し、何度走らせても同じ結果になります。
 
 ## 13. 派生リポジトリ
 
@@ -279,4 +289,4 @@ WebChat は ChatGPT の Web 画面で、利用者が手で操作します。台�
 
 復元の試験は、IDA が自動で付ける中継の名前（`j_`）を不一致に数えず参考として出す。作業場にも監査の CI と main の保護がある（2026-11-05）。
 
-`scripts/tests` は、作業ツリーにジャンクションで `ac3ds-re` を張って走らせると `audit` の CRLF で落ちる物がある。本体で走らせる。
+`scripts/tests` が作業ツリーで CRLF で落ちたのは、`workspace.local.toml` が無く msys2 の git を使ったためだった（2026-11-09。12.2 節）。
