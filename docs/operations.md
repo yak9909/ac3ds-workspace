@@ -242,9 +242,10 @@ WebChat は ChatGPT の Web 画面で、利用者が手で操作します。台�
 
 `orch.py` の依頼先に作業場はありません。道具の変更は、道具のワーカー（Agent ツールの `tooling`）に作業場の作業ツリーで頼みます。
 
-- **作業ツリー**: `workspace.local.toml` の `git`（`C:/Program Files/Git/cmd/git.exe`）で `_local/worktrees/ws-<名前>` に作り、`workspace.local.toml` を写して、`ac3ds-re` をジャンクションで張ります。PATH の先頭の `git` は devkitPro の msys2 の物で、これで作ると `.git` が msys 形式のパスになり Git Bash から使えません。`workspace.local.toml` が無いと道具と試験もその git を使い、`scripts/tests` の stamp・accept の試験が `audit` の CRLF で落ちます。
+- **作業ツリー**: `orch.py ws add <名前> --branch <ブランチ>` で作ります。`workspace.local.toml` の `git`（`C:/Program Files/Git/cmd/git.exe`）で `_local/worktrees/ws-<名前>` に作り、`workspace.local.toml` を写して、`ac3ds-re` をジャンクションで張ります。PATH の先頭の `git` は devkitPro の msys2 の物で、これで作ると `.git` が msys 形式のパスになり Git Bash から使えません。`workspace.local.toml` が無いと道具と試験もその git を使い、`scripts/tests` の stamp・accept の試験が `audit` の CRLF で落ちます。
+- **消す時**: `orch.py ws remove <名前>` だけで消します。手で `git worktree remove --force` や再帰の削除をしません。Git for Windows は中のジャンクションを辿り、先の中身まで消すからです（2026-11-09 に本体の ac3ds-re が `.git` ごと消え、clone し直した）。`ws remove` と `orch.py` の片付けは、リンクを辿らずに外してから消し、消した後に本体の `ac3ds-re/.git` が残っているかを確かめます。
 - **採点**: 司令塔が差分を読み、作業ツリーで `scripts/tests` を走らせます（全体で 20 分ほど。裏で走らせる）。
-- **取り込み**: main は保護され、監査の CI（`audit`）が必須です。push → `gh pr create` → `gh pr checks <n> --watch` → `gh api -X PUT repos/yak9909/ac3ds-workspace/pulls/<n>/merge -f merge_method=merge`（`gh pr merge --delete-branch` はこの環境で止まる）→ 本体で `git pull --ff-only` し、作業ツリーとブランチを消します。
+- **取り込み**: main は保護され、監査の CI（`audit`）が必須です。push → `gh pr create` → `gh pr checks <n> --watch` → `gh api -X PUT repos/yak9909/ac3ds-workspace/pulls/<n>/merge -f merge_method=merge`（`gh pr merge --delete-branch` はこの環境で止まる）→ 本体で `git pull --ff-only` し、`orch.py ws remove <名前>` で作業ツリーとブランチを消します。
 - **ラベルを足した時**: `orch.py setup-github <リポジトリ>`（リポジトリは位置引数）。リポジトリの設定・ラベル・main の保護を書き直し、何度走らせても同じ結果になります。
 
 ## 13. 派生リポジトリ
