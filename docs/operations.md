@@ -233,6 +233,7 @@ WebChat は ChatGPT の Web 画面で、利用者が手で操作します。台�
 - **依頼**: `orch.py issue --webchat ...`（解析リポジトリだけ）で、ラベル `webchat` と WebChat への指示を付けた Issue を作ります。
 - **受け箱**: WebChat は記録の下書きを `inbox/webchat/<Issue 番号>/<連番>.md` に置き、ブランチ `webchat/<Issue 番号>` から PR を出します。PR 本文の先頭は `Issue #N` です。PR の差分が受け箱の外に及ぶ物は取り込みません。
 - **取り込み**: `orch.py webchat verify <PR>`（ブランチを作業ツリーに取り出し、main に追いつかせ、機械の検証を走らせる）、`webchat accept <PR> --scores ... --read <ファイル>`（検証の後に `kb.py intake --issue N --by gpt-6-sol` で ID を振り、結果を push して PR にコメントし、取り込む。Issue は閉じる）、`webchat reject <PR> --reason ...`（PR を閉じる。Issue は開いたまま）です。採点表は解析の物を使います。
+- **直しの依頼**: 利用者が、開いている WebChat の PR に直しを頼むことがあります。WebChat は同じブランチに push し、PR に「利用者の指示」と直した報告をコメントします（手順書 9 節）。直しのコメントの後に、利用者から「終わった」と伝わるまで `webchat verify` に進みません。取り込み済みの PR は直さず、新しい Issue と `supersedes:` つきの下書きで訂正します。打ち切った PR は、同じ Issue でやり直します。
 - **始める時（1 回だけ）**: `orch.py setup-github ac3ds-re` でラベルを作り、利用者が手順書を ChatGPT のプロジェクトに貼ります（2026-11-09 に済み）。
 
 ### 12.2 作業場（ac3ds-workspace）の変更
