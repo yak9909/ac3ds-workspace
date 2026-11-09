@@ -901,7 +901,7 @@ def analysis_leaks(c: Ctx, text: str) -> list[str]:
 def webchat_section() -> str:
     return ("### WebChat への指示\n\n"
             "- この Issue を取る時に、ラベル「%s」を付ける。\n"
-            "- 記録の下書きは `%s/<この Issue の番号>/<連番>.md` に置く（連番は 01, 02, ... ）。"
+            "- 記録の下書きは `%s/<この Issue の番号>/<連番>.md` に置く（連番は 1, 2, ... ）。"
             "ID は書かない（司令塔が振る）。\n"
             "- ブランチ `webchat/<この Issue の番号>` から PR を出し、PR 本文の先頭に `Issue #<この Issue の番号>` と書く。"
             "PR の差分は `%s/<この Issue の番号>/` の中だけにする。\n"
