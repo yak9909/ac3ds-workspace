@@ -39,8 +39,8 @@ def read_config(repo: Path, config_path: Path | None = None) -> tuple[str, Path,
     # --config の相対パスは CLI の通常の規則どおり、現在のディレクトリを基準にする。
     config = tomllib.loads((config_path if config_path is not None else repo / "game_api.toml").read_text(encoding="utf-8"))
     required = {"build", "output", "functions", "globals", "types"}
-    if not required <= set(config) or set(config) - required - {"namespace", "hooks", "checks"}:
-        raise ValueError("一覧の項目は build, output, functions, globals, types（任意: namespace, hooks, checks）にしてください")
+    if not required <= set(config) or set(config) - required - {"namespace", "hooks", "checks", "vtables"}:
+        raise ValueError("一覧の項目は build, output, functions, globals, types（任意: namespace, hooks, checks, vtables）にしてください")
     build, output = config["build"], config["output"]
     if not isinstance(build, str) or not IDENT.fullmatch(build):
         raise ValueError("build が不正です")
@@ -54,6 +54,7 @@ def read_config(repo: Path, config_path: Path | None = None) -> tuple[str, Path,
     if not isinstance(namespace, str) or (namespace and any(
             not IDENT.fullmatch(part) or part in CPP_KEYWORDS for part in namespace.split("::"))):
         raise ValueError("namespace は C++ の名前空間名にしてください（入れ子は ::）")
+    names["vtables"] = require_names(config.get("vtables", []), "vtables")
     names["namespace"] = namespace
     used = set(names["functions"] + names["globals"])
     for label in ("hooks", "checks"):
@@ -293,6 +294,18 @@ def generate(repo: Path, config_path: Path | None = None) -> Path:
         raise ValueError(f"symbols がないビルド: {build}")
     functions = read_symbols(symbols / "functions")
     globals_ = read_symbols(symbols / "globals")
+    vtables = {}
+    for table in sorted((symbols / "vtables").glob("*.csv")):
+        with table.open(encoding="utf-8-sig", newline="") as stream:
+            for row in csv.DictReader(stream):
+                name = row["class"]
+                if name in wanted["vtables"]:
+                    if name in vtables:
+                        raise ValueError(f"重複した仮想表: {name}")
+                    vtables[name] = row
+    missing = set(wanted["vtables"]) - set(vtables)
+    if missing:
+        raise ValueError("見つからない仮想表: " + ", ".join(sorted(missing)))
     definitions, kinds = read_types(symbols / "types")
     for label, names, available in (("関数", wanted["functions"], functions),
                                     ("大域変数", wanted["globals"], globals_)):
@@ -331,6 +344,8 @@ def generate(repo: Path, config_path: Path | None = None) -> Path:
         lines.append(f"using {name}_t = {typ};")
         lines.append(f"inline constexpr std::uintptr_t {name}_addr = {address(globals_[name])};")
         lines.append("")
+    for name in wanted["vtables"]:
+        lines.extend([f"inline constexpr std::uintptr_t {name}_vtable = {address(vtables[name])};", ""])
     lines.extend(verification)
     if wanted["namespace"]:
         lines.append(f"}} // namespace {wanted['namespace']}")
