@@ -130,6 +130,34 @@ class ExportGameApiTests(unittest.TestCase):
             self.assertIn(f"{name}_crc32 = 0x{zlib.crc32(self.code[position:position + 4]):08X};", content)
         self.assertNotIn("ac3ds-re", content)
 
+    def add_vtables(self, names='["Foo"]'):
+        folder = self.symbols / "vtables"
+        folder.mkdir(exist_ok=True)
+        self.write_csv(folder / "00100000.csv", ["address", "class", "count"],
+                       [["0x00200010", "Foo", "3"], ["0x00200020", "Bar", "2"]])
+        path = self.repo / "game_api.toml"
+        path.write_text(f"vtables = {names}\n" + path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    def test_vtables_are_exported_by_class_name(self):
+        self.add_vtables('["Foo", "Bar"]')
+        content = api.generate(self.repo).read_text(encoding="utf-8")
+        self.assertIn("inline constexpr std::uintptr_t Foo_vtable = 0x00200010;", content)
+        self.assertIn("inline constexpr std::uintptr_t Bar_vtable = 0x00200020;", content)
+
+    def test_unknown_vtable_is_error(self):
+        self.add_vtables('["Missing"]')
+        with self.assertRaisesRegex(ValueError, "見つからない仮想表: Missing"):
+            api.generate(self.repo)
+
+    def test_invalid_or_duplicate_vtable_names_are_errors(self):
+        self.add_vtables('["Foo", "Foo"]')
+        with self.assertRaisesRegex(ValueError, "vtables に重複"):
+            api.generate(self.repo)
+
+    def test_without_vtables_output_has_no_vtable_lines(self):
+        content = api.generate(self.repo).read_text(encoding="utf-8")
+        self.assertNotIn("_vtable", content)
+
     def test_offset_and_length_boundaries(self):
         path = self.symbols / "functions/00100000.csv"
         path.write_text(path.read_text(encoding="utf-8").replace("0x00123457,4,", "0x00123457,68,"), encoding="utf-8")
