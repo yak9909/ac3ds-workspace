@@ -50,7 +50,7 @@ def expire(data, now):
 
 
 def update_usage(state, updates):
-    """提供元ごとの差分を、statusline と共有するロックの下で保存する。"""
+    """提供元ごとの差分を、ロックの下で保存する。"""
     state.mkdir(parents=True, exist_ok=True)
     path = state / "usage.json"
     with FileLock(str(state / "usage.lock"), timeout=2):
@@ -191,6 +191,26 @@ def threshold(root):
         return 80
 
 
+def shared_usage_path():
+    """アカウント共通の見張りが書く usage.json。環境変数 CLAUDE_CONFIG_DIR（無ければ ~/.claude）の下。"""
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+    return Path(base) / "usage-guard" / "usage.json"
+
+
+def shared_claude_usage():
+    """共通の usage.json から Claude の値を読む。5時間枠の使用率と更新時刻が無ければ None。"""
+    raw = read_json(shared_usage_path())
+    pct, updated = number(raw.get("five_hour_used_percent")), number(raw.get("updated"))
+    if pct is None or updated is None:
+        return None
+    data = {"five_hour_used_percent": pct, "resets_at": raw.get("resets_at"), "updated": updated}
+    weekly = number(raw.get("weekly_used_percent"))
+    if weekly is not None:
+        data["weekly_used_percent"] = weekly
+        data["weekly_resets_at"] = raw.get("weekly_resets_at")
+    return data
+
+
 def collect(root=None, *, sessions=None, now=None):
     root = root or wslib.workspace_root()
     now = time.time() if now is None else now
@@ -204,13 +224,9 @@ def collect(root=None, *, sessions=None, now=None):
     def updates(data):
         claude = data.get("claude", {})
         claude = claude if isinstance(claude, dict) else {}
-        last = state / "statusline_last.json"
-        if not claude or (last.exists() and last.stat().st_mtime > (number(claude.get("updated")) or 0)):
-            from statusline import find_five_hour
-            pct, reset = find_five_hour(read_json(last))
-            if pct is not None:
-                claude = {"five_hour_used_percent": pct, "resets_at": reset,
-                          "updated": int(last.stat().st_mtime)}
+        shared = shared_claude_usage()
+        if shared is not None and (not claude or shared["updated"] > (number(claude.get("updated")) or 0)):
+            claude = shared
         cached = data.get("codex", {})
         current = codex if codex is not None else (cached if isinstance(cached, dict) else {})
         return {"claude": expire(claude, now), "codex": expire(current, now)}
@@ -232,7 +248,7 @@ def claude_rate_limit(line):
 
 
 def record_claude_usage(state, line):
-    """ワーカーの実測を usage.json に残す。statusline は司令塔が動く時しか更新されないので、見張りと capacity のため。"""
+    """ワーカーの実測を usage.json に残す。claude -p には status line が無いので、見張りと capacity のためにここで残す。"""
     found = claude_rate_limit(line)
     if found is None:
         return

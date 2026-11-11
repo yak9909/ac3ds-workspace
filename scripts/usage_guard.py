@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""フックから利用枠の中断指示を、相手・5時間枠ごとに一度だけ差し込む。"""
+"""Codex のフックから利用枠の中断指示を、5時間枠ごとに一度だけ差し込む。
+Claude Code はアカウント共通の見張りが担うので、ここでは何もしない。"""
 from __future__ import annotations
 
 import hashlib
@@ -13,7 +14,7 @@ import wslib
 
 def cleanup_markers(directory, now):
     """期限切れの印を片付ける。同時に別のフックが消しても続ける。"""
-    for provider in ("claude", "codex"):
+    for provider in ("claude", "codex"):  # claude の物は旧フックの残り
         for marker in directory.glob(provider + "-*"):
             try:
                 if marker.name.startswith(provider + "-v2-") and marker.suffix == ".json":
@@ -29,7 +30,7 @@ def cleanup_markers(directory, now):
 
 def guard(provider, payload, root=None):
     root = root or wslib.workspace_root()
-    if provider not in ("claude", "codex") or not isinstance(payload, dict):
+    if provider != "codex" or not isinstance(payload, dict):
         return None
     session = payload.get("session_id")
     event = payload.get("hook_event_name")
@@ -44,10 +45,7 @@ def guard(provider, payload, root=None):
     if pct is None or pct < usage_watch.threshold(root):
         return None
     message = "利用枠の5時間枠が %g%% に達した。" % pct
-    if provider == "codex" or payload.get("agent_id"):
-        message += "区切りの良い所で作業を止め、作業ツリーの .task/notes.md に経過と次の1手を書き、報告して終える。"
-    else:
-        message += "新しい依頼を出さず、スキル wrapup の手順で中断する。"
+    message += "区切りの良い所で作業を止め、作業ツリーの .task/notes.md に経過と次の1手を書き、報告して終える。"
     reset = usage_watch.number(usage.get("resets_at"))
     if reset is None:
         # リセット時刻が無い場合は、UTCの時刻を5時間単位に区切る。
