@@ -8,7 +8,6 @@ import pytest
 import audit
 import check_derived
 import fetch_tools
-import statusline
 import sync_skills
 import wslib
 from conftest import FAKE_EMAIL, FAKE_TOKEN, FAKE_USERPATH, REAL_ROOT
@@ -126,28 +125,6 @@ def test_fetch_exe_hash_mismatch(tmp_path):
     assert (tools / "t" / "1.0" / "tool.exe").exists()
 
 
-# ---- statusline ----
-def test_statusline_with_limits(ws):
-    raw = json.dumps({"model": {"display_name": "Opus"}, "workspace": {"current_dir": str(ws / "re")},
-                      "rate_limits": {"five_hour": {"used_percentage": 23.5, "resets_at": 1738425600}}})
-    line = statusline.render(raw, ws)
-    assert "Opus" in line and "| re |" in line and "24%" in line
-    u = json.loads((ws / "_local" / "state" / "usage.json").read_text(encoding="utf-8"))
-    assert u["claude"]["five_hour_used_percent"] == 23.5
-    assert u["claude"]["resets_at"] == 1738425600 and "updated" in u["claude"]
-
-
-def test_statusline_without_limits(ws):
-    line = statusline.render(json.dumps({"model": {"display_name": "Sonnet"}}), ws)
-    assert "取得不可" in line and "Sonnet" in line
-    assert not (ws / "_local" / "state" / "usage.json").exists()
-
-
-@pytest.mark.parametrize("raw", ["{broken", "", "[1,2]", "null"])
-def test_statusline_broken(ws, raw):
-    assert statusline.render(raw, ws).strip() != ""
-
-
 # ---- check_derived ----
 def test_derived_positive():
     for t in ("see ACNL-F0123", "see HHD-F12345", "uses ac3ds-re", "read findings/x.md", "see topics/y",
@@ -158,26 +135,3 @@ def test_derived_positive():
 def test_derived_negative():
     mod = wslib.load_re_audit(REAL_ROOT)
     assert check_derived.check_text("a.md", "ゲームの事実: 家具は 0x10 バイト。ACNL-F12 は短い。", mod) == []
-
-
-# ---- statusline: 保存と別名 ----
-def test_statusline_saves_raw(ws):
-    for raw in ('{"a": 1}', "{broken"):
-        statusline.render(raw, ws)
-        assert (ws / "_local" / "state" / "statusline_last.json").read_text(encoding="utf-8") == raw
-
-
-@pytest.mark.parametrize("rl", [
-    {"five_hour": {"used_percent": 40, "resets_at": 5}},
-    {"fiveHour": {"utilization": "40%", "resetsAt": 5}},
-])
-def test_statusline_aliases(ws, rl):
-    line = statusline.render(json.dumps({"rate_limits": rl}), ws)
-    assert "40%" in line
-    assert json.loads((ws / "_local" / "state" / "usage.json").read_text(encoding="utf-8"))["claude"][
-        "five_hour_used_percent"] == 40
-
-
-def test_statusline_top_level_and_absent_window(ws):
-    assert "7%" in statusline.render(json.dumps({"five_hour": {"used_percentage": 7}}), ws)
-    assert "取得不可" in statusline.render(json.dumps({"rate_limits": {"seven_day": {"used_percentage": 9}}}), ws)

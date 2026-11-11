@@ -12,9 +12,16 @@ import pytest
 
 import capacity
 import orch
-import statusline
 import usage_guard
 import usage_watch
+
+
+@pytest.fixture(autouse=True)
+def shared_dir(tmp_path, monkeypatch):
+    """共通の usage.json の場所を試験用に差し替える。"""
+    base = tmp_path / "claude-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(base))
+    return base / "usage-guard" / "usage.json"
 
 
 def write_json(path, data):
@@ -52,15 +59,51 @@ def test_collect_rollout_and_expiry(tmp_path):
     assert usage_watch.collect(tmp_path, sessions=sessions, now=300)["codex"]["weekly_used_percent"] == 0
 
 
-def test_statusline_fallback_and_preserves_codex(tmp_path):
+def test_collect_reads_shared_usage_and_preserves_codex(tmp_path, shared_dir):
     state = tmp_path / "_local/state"
     write_json(state / "usage.json", {"codex": {"five_hour_used_percent": 23}})
-    write_json(state / "statusline_last.json", {"rate_limits": {
-        "five_hour": {"used_percentage": 81, "resets_at": 9999999999}}})
+    write_json(shared_dir, {"five_hour_used_percent": 81, "resets_at": 9999999999, "updated": 10,
+                            "weekly_used_percent": 40, "weekly_resets_at": 9999999999})
     data = usage_watch.collect(tmp_path, sessions=tmp_path / "absent", now=100)
-    assert data["claude"]["five_hour_used_percent"] == 81
-    statusline.write_usage(tmp_path, 82, 9999999999)
-    assert usage_watch.read_json(state / "usage.json")["codex"]["five_hour_used_percent"] == 23
+    assert data["claude"] == {"five_hour_used_percent": 81, "resets_at": 9999999999, "updated": 10,
+                              "weekly_used_percent": 40, "weekly_resets_at": 9999999999}
+    assert data["codex"]["five_hour_used_percent"] == 23
+
+
+def test_collect_prefers_newer_of_shared_and_worker(tmp_path, shared_dir):
+    state = tmp_path / "_local/state"
+    write_json(shared_dir, {"five_hour_used_percent": 81, "resets_at": 9999999999, "updated": 50})
+    write_json(state / "usage.json", {"claude": {
+        "five_hour_used_percent": 30, "resets_at": 9999999999, "updated": 60}})
+    data = usage_watch.collect(tmp_path, sessions=tmp_path / "absent", now=100)
+    assert data["claude"]["five_hour_used_percent"] == 30
+    write_json(shared_dir, {"five_hour_used_percent": 90, "resets_at": 9999999999, "updated": 70})
+    data = usage_watch.collect(tmp_path, sessions=tmp_path / "absent", now=100)
+    assert data["claude"]["five_hour_used_percent"] == 90
+
+
+def test_collect_without_shared_keeps_worker_value_and_expires(tmp_path):
+    state = tmp_path / "_local/state"
+    write_json(state / "usage.json", {"claude": {
+        "five_hour_used_percent": 55, "resets_at": 200, "updated": 60}})
+    assert usage_watch.collect(tmp_path, sessions=tmp_path / "absent", now=100)["claude"][
+        "five_hour_used_percent"] == 55
+    write_json(tmp_path / "claude-config/usage-guard/usage.json",
+               {"five_hour_used_percent": "壊れた", "updated": 99})
+    assert usage_watch.collect(tmp_path, sessions=tmp_path / "absent", now=300)["claude"][
+        "five_hour_used_percent"] == 0
+
+
+def test_shared_usage_path_follows_config_dir(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    assert usage_watch.shared_usage_path() == tmp_path / "usage-guard" / "usage.json"
+
+
+def test_claude_provider_does_nothing(tmp_path, monkeypatch):
+    monkeypatch.setenv("AC3DS_GUARD_THRESHOLD", "80")
+    monkeypatch.setattr(usage_watch, "collect", lambda *_: {"claude": {"five_hour_used_percent": 99}})
+    payload = {"session_id": "s", "hook_event_name": "PreToolUse"}
+    assert usage_guard.guard("claude", payload, tmp_path) is None
 
 
 RATE_LINE = json.dumps({"type": "rate_limit_event", "rate_limit_info": {
@@ -109,8 +152,7 @@ def test_reverse_lines_crosses_blocks(tmp_path):
 
 
 @pytest.mark.parametrize("provider,agent,expected", [
-    ("claude", None, "スキル wrapup"), ("claude", "worker-1", ".task/notes.md"),
-    ("codex", None, ".task/notes.md")])
+    ("codex", None, ".task/notes.md"), ("codex", "worker-1", ".task/notes.md")])
 def test_guard_threshold_once_and_message(tmp_path, monkeypatch, capsys, provider, agent, expected):
     monkeypatch.setenv("AC3DS_GUARD_THRESHOLD", "80")
     monkeypatch.setattr(usage_guard.wslib, "workspace_root", lambda: tmp_path)
@@ -155,7 +197,7 @@ def test_guard_failure_is_silent(monkeypatch, capsys):
     assert capsys.readouterr().out == ""
 
 
-@pytest.mark.parametrize("provider", ["claude", "codex"])
+@pytest.mark.parametrize("provider", ["codex"])
 def test_guard_once_per_window(tmp_path, monkeypatch, provider):
     monkeypatch.setenv("AC3DS_GUARD_THRESHOLD", "80")
     clock = [100]
@@ -187,13 +229,13 @@ def test_guard_each_agent_in_shared_session(tmp_path, monkeypatch, agents):
     monkeypatch.setenv("AC3DS_GUARD_THRESHOLD", "80")
     monkeypatch.setattr(usage_guard.time, "time", lambda: 100)
     monkeypatch.setattr(usage_watch, "collect", lambda *_: {
-        "claude": {"five_hour_used_percent": 80, "resets_at": 200}})
+        "codex": {"five_hour_used_percent": 80, "resets_at": 200}})
     for agent in agents:
         payload = {"session_id": "shared", "agent_id": agent, "hook_event_name": "PreToolUse"}
-        output = usage_guard.guard("claude", payload, tmp_path)
+        output = usage_guard.guard("codex", payload, tmp_path)
         message = output["hookSpecificOutput"]["additionalContext"]
-        assert (".task/notes.md" if agent else "スキル wrapup") in message
-        assert usage_guard.guard("claude", payload, tmp_path) is None
+        assert ".task/notes.md" in message
+        assert usage_guard.guard("codex", payload, tmp_path) is None
     assert len(list((tmp_path / "_local/state/guard").glob("*.json"))) == len(agents)
 
 
@@ -203,14 +245,14 @@ def test_guard_without_reset_uses_time_window(tmp_path, monkeypatch, reset):
     clock = [100]
     monkeypatch.setattr(usage_guard.time, "time", lambda: clock[0])
     monkeypatch.setattr(usage_watch, "collect", lambda *_: {
-        "claude": {"five_hour_used_percent": 85, "resets_at": reset}})
+        "codex": {"five_hour_used_percent": 85, "resets_at": reset}})
     payload = {"session_id": "shared", "hook_event_name": "PreToolUse"}
-    assert usage_guard.guard("claude", payload, tmp_path) is not None
+    assert usage_guard.guard("codex", payload, tmp_path) is not None
     clock[0] = 5 * 60 * 60 - 1
-    assert usage_guard.guard("claude", payload, tmp_path) is None
+    assert usage_guard.guard("codex", payload, tmp_path) is None
     clock[0] = 5 * 60 * 60
-    assert usage_guard.guard("claude", payload, tmp_path) is not None
-    assert usage_guard.guard("claude", payload, tmp_path) is None
+    assert usage_guard.guard("codex", payload, tmp_path) is not None
+    assert usage_guard.guard("codex", payload, tmp_path) is None
     assert len(list((tmp_path / "_local/state/guard").glob("*.json"))) == 1
 
 
@@ -218,7 +260,7 @@ def test_guard_cleans_expired_markers_below_threshold(tmp_path, monkeypatch):
     monkeypatch.setenv("AC3DS_GUARD_THRESHOLD", "80")
     monkeypatch.setattr(usage_guard.time, "time", lambda: 200)
     monkeypatch.setattr(usage_watch, "collect", lambda *_: {
-        "claude": {"five_hour_used_percent": 0, "resets_at": 400}})
+        "codex": {"five_hour_used_percent": 0, "resets_at": 400}})
     directory = tmp_path / "_local/state/guard"
     expired = directory / "claude-v2-expired.json"
     current = directory / "claude-v2-current.json"
@@ -236,7 +278,7 @@ def test_guard_cleans_expired_markers_below_threshold(tmp_path, monkeypatch):
     unrelated.write_text("保持", encoding="utf-8")
 
     payload = {"session_id": "shared", "hook_event_name": "PreToolUse"}
-    assert usage_guard.guard("claude", payload, tmp_path) is None
+    assert usage_guard.guard("codex", payload, tmp_path) is None
     assert set(directory.iterdir()) == {current, recent_legacy, unrelated}
 
 
@@ -287,16 +329,11 @@ def test_notify(monkeypatch, capsys):
     assert "claude" in next(line for line in lines if "利用枠の通知" in line)
 
 
-def test_claude_hooks_keep_statusline():
+def test_claude_settings_have_no_hooks_or_statusline():
     root = Path(__file__).resolve().parents[2]
     settings = json.loads((root / ".claude/settings.json").read_text(encoding="utf-8"))
-    assert "scripts/statusline.py" in settings["statusLine"]["command"]
-    for event in ("PreToolUse", "PostToolUse"):
-        entry = settings["hooks"][event][0]
-        assert entry["matcher"] == ".*"
-        assert entry["hooks"][0]["command"] == "${CLAUDE_PROJECT_DIR}/_local/venv/tools/Scripts/python.exe"
-        assert entry["hooks"][0]["args"] == [
-            "${CLAUDE_PROJECT_DIR}/scripts/usage_guard.py", "--provider", "claude"]
+    assert "hooks" not in settings and "statusLine" not in settings
+    assert settings["language"] == "japanese"
 
 
 def test_expire_independent_windows():
