@@ -268,7 +268,104 @@ def address(row: dict[str, str]) -> str:
     return f"0x{value:08X}"
 
 
-def function_lines(name: str, row: dict[str, str]) -> list[str]:
+def usercall_scalar(typ: str, definitions: dict[str, str]) -> str | None:
+    """AAPCS-VFP で扱う単純な型だけ分類する。typedef の推測はしない。"""
+    if any(token in typ for token in ("(", ")", "[", "]", "&", "@")):
+        return None
+    if "*" in typ:
+        return "integer"
+    typ = re.sub(r"\b(?:const|volatile)\b", "", typ)
+    typ = " ".join(typ.split())
+    if typ == "float":
+        return "float"
+    if typ in {"bool", "char", "signed char", "unsigned char", "wchar_t", "char16_t", "char32_t",
+               "short", "short int", "signed short", "signed short int", "unsigned short",
+               "unsigned short int", "int", "signed", "signed int", "unsigned", "unsigned int",
+               "long", "long int", "signed long", "signed long int", "unsigned long",
+               "unsigned long int"} or re.fullmatch(r"std::u?int(?:8|16|32)_t", typ):
+        return "integer"
+    enum_name = re.sub(r"^enum\s+", "", typ)
+    enum = ENUM_DEFINITION.search(definitions.get(enum_name, ""))
+    if enum and enum.group(1) == enum_name:
+        base = ENUM_BASE.fullmatch((enum.group(2) or "").strip())
+        if base and int(base.group(2)) <= 32:
+            return "integer"
+    return None
+
+
+def usercall_float_pair(typ: str, definitions: dict[str, str]) -> bool:
+    """名前だけでは判断せず、単純な float 2 欄の構造体であることを確かめる。"""
+    struct_name = re.sub(r"^struct\s+", "", typ.strip())
+    body = definitions.get(struct_name, "")
+    body = re.sub(r"^\s*#pragma pack\([^\n]*\)\s*$", "", body, flags=re.M)
+    return re.fullmatch(
+        r"\s*struct\s+" + re.escape(struct_name)
+        + r"\s*\{\s*float\s+([A-Za-z_]\w*)\s*;\s*float\s+([A-Za-z_]\w*)\s*;\s*\}\s*;\s*",
+        body,
+    ) is not None
+
+
+def normalize_usercall(name: str, result: str, arguments: str,
+                       definitions: dict[str, str]) -> tuple[str, str]:
+    def reject(reason: str) -> None:
+        raise ValueError(f"{name}: __usercall {reason}")
+
+    returned = re.fullmatch(r"(.+?)\s+__usercall\s*(?:@<([^<>]+)>)?", result.strip())
+    if not returned:
+        reject("戻り値の宣言を解釈できません")
+    typ, location = returned.groups()
+    typ = typ.strip()
+    if typ == "void":
+        if location is not None:
+            reject("void の戻り値に位置の注記があります")
+    elif location == "S1:S0":
+        if not usercall_float_pair(typ, definitions):
+            reject("S1:S0 の戻り値は float 2 欄の構造体に限ります")
+    else:
+        kind = usercall_scalar(typ, definitions)
+        if kind is None:
+            reject(f"未対応の戻り値の型: {typ}")
+        expected = "S0" if kind == "float" else "R0"
+        if location != expected:
+            reject(f"戻り値の位置は {expected} が必要です（指定: {location}）")
+
+    clean = []
+    core, vfp = 0, 0
+    if arguments.strip() not in ("", "void"):
+        for index, argument in enumerate(arguments.split(","), 1):
+            annotated = re.fullmatch(r"\s*(.+?)\s*@<([^<>]+)>\s*", argument)
+            if not annotated:
+                reject(f"引数 {index} に解釈できる位置の注記がありません")
+            declaration, register = annotated.groups()
+            # 名前の無い宣言も許す。名前付きなら最後の識別子だけを外して型を調べる。
+            kind = usercall_scalar(declaration, definitions)
+            if kind is None:
+                named = re.fullmatch(r"(.+?[\s*])([A-Za-z_]\w*)", declaration)
+                if named and named.group(2) not in CPP_KEYWORDS:
+                    kind = usercall_scalar(named.group(1).strip(), definitions)
+            if kind is None:
+                reject(f"引数 {index} は未対応の型です: {declaration}")
+            if kind == "float":
+                if vfp >= 16:
+                    reject(f"引数 {index} は VFP レジスタの範囲外です（スタックは未対応）")
+                expected = f"S{vfp}"
+                vfp += 1
+            else:
+                if core >= 4:
+                    reject(f"引数 {index} は5つ目以降の整数・ポインタです（スタックは未対応）")
+                expected = f"R{core}"
+                core += 1
+            if register != expected:
+                reject(f"引数 {index} の位置は {expected} が必要です（指定: {register}）")
+            clean.append(declaration.strip())
+        arguments = ", ".join(clean)
+    if "@<" in typ or "@<" in arguments:
+        reject("変換後に位置の注記が残っています")
+    return typ, arguments
+
+
+def function_lines(name: str, row: dict[str, str],
+                   definitions: dict[str, str] | None = None) -> list[str]:
     prototype = row["prototype"].strip()
     addr = address(row)
     if not prototype:
@@ -280,6 +377,8 @@ def function_lines(name: str, row: dict[str, str]) -> list[str]:
     if not match:
         raise ValueError(f"解釈できないプロトタイプ: {name}")
     result, arguments = match.groups()
+    if re.search(r"\b__usercall\b", prototype):
+        result, arguments = normalize_usercall(name, result, arguments, definitions or {})
     return [f"using {name}_t = {result.strip()} (*)({arguments.strip()});",
             f"inline constexpr std::uintptr_t {name}_addr = {addr};"]
 
@@ -335,7 +434,7 @@ def generate(repo: Path, config_path: Path | None = None) -> Path:
             continue  # <cstdint> の型を重ねて定義しない
         lines.extend([definitions[name], ""])
     for name in wanted["functions"]:
-        lines.extend(function_lines(name, functions[name]) + [""])
+        lines.extend(function_lines(name, functions[name], definitions) + [""])
     for name in wanted["globals"]:
         raw_type = globals_[name]["type"].strip()
         if not raw_type:
