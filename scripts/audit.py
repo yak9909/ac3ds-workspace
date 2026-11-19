@@ -27,7 +27,7 @@ MAX_SIZE = 1024 * 1024
 TEXT_EXT = {".md", ".toml", ".py", ".yml", ".yaml", ".json", ".txt", ".ps1", ".csv", ".h"}
 # この試験の IDA 形式の入力例だけを識別する。内容が変われば通常どおり検出する。
 TEST_FIXTURE_DECOMP = ("scripts/tests/test_export_game_api.py",
-                       "疑似C:6d4fc1a7b3cb101fe21799b0fcf5271f40c2638a62ff830ed354f54171df4325")
+                       "疑似C:390be948f1100a4bc1f1971e3db19917095deda9f1f37e5287a9bba944edc051")
 
 
 def check_outgoing(text: str) -> list:
