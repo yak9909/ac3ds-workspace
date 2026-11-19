@@ -261,6 +261,97 @@ class ExportGameApiTests(unittest.TestCase):
         for leftover in ("signed std::", "unsigned std::", "__int"):
             self.assertNotIn(leftover, content)
 
+    def usercall_header(self, name, prototype):
+        (self.symbols / "types/usercall.h").write_text(
+            "// type: UiAnim\nstruct UiAnim { int value; };\n"
+            "// type: NwLytPane\nstruct NwLytPane { int value; };\n"
+            "// type: AcnlUiPoint2\n#pragma pack(push, 2)\n"
+            "struct AcnlUiPoint2 { float x; float y; };\n#pragma pack(pop)\n"
+            "// type: Mode\nenum Mode { Mode_A = 0 };\n"
+            "// type: Wide\nenum Wide : unsigned __int64 { Wide_A = 0 };\n",
+            encoding="utf-8")
+        self.write_csv(self.symbols / "functions/00100000.csv",
+                       ["address", "size", "name", "prototype"],
+                       [["0x00123457", "4", name, prototype]])
+        self.config(functions=f'["{name}"]')
+        return api.generate(self.repo).read_text(encoding="utf-8")
+
+    def test_usercall_ui_anim_set_frame(self):
+        content = self.usercall_header(
+            "UiAnim_SetFrame", "void __usercall(UiAnim *anim@<R0>, float frame@<S0>)")
+        self.assertIn("using UiAnim_SetFrame_t = void (*)(UiAnim *anim, float frame);", content)
+        self.assertNotIn("__usercall", content)
+        self.assertNotIn("@<", content)
+
+    def test_usercall_pane_get_anchor_offset(self):
+        content = self.usercall_header(
+            "Pane_GetAnchorOffset", "AcnlUiPoint2 __usercall@<S1:S0>(const NwLytPane *pane@<R0>)")
+        self.assertIn("using Pane_GetAnchorOffset_t = AcnlUiPoint2 (*)(const NwLytPane *pane);", content)
+        self.assertIn("struct AcnlUiPoint2 { float x; float y; };", content)
+
+    def test_usercall_calc_string_width(self):
+        content = self.usercall_header(
+            "nwfont_TextWriter_CalcStringWidth",
+            "float __usercall@<S0>(const void *writer@<R0>, const uint16_t *text@<R1>, int length@<R2>)")
+        self.assertIn("using nwfont_TextWriter_CalcStringWidth_t = float (*)(const void *writer, "
+                      "const std::uint16_t *text, int length);", content)
+
+    def test_usercall_recompute_scale(self):
+        content = self.usercall_header(
+            "nwfont_CharWriter_RecomputeScale",
+            "void __usercall(void *writer@<R0>, float width@<S0>, float height@<S1>)")
+        self.assertIn("using nwfont_CharWriter_RecomputeScale_t = void (*)(void *writer, "
+                      "float width, float height);", content)
+
+    def test_usercall_rejects_unsupported_prototypes_without_writing(self):
+        cases = (
+            ("void __usercall(float a@<S1>, float b@<S0>)", "引数 1 の位置は S0"),
+            ("void __usercall(int a@<R1>)", "引数 1 の位置は R0"),
+            ("void __usercall(double a@<R0>)", "引数 1 は未対応の型"),
+            ("void __usercall(long long@<R0>)", "引数 1 は未対応の型"),
+            ("void __usercall(unsigned __int64 a@<R0>)", "引数 1 は未対応の型"),
+            ("void __usercall(Node a@<R0>)", "引数 1 は未対応の型"),
+            ("void __usercall(Unknown a@<R0>)", "引数 1 は未対応の型"),
+            ("void __usercall(Wide a@<R0>)", "引数 1 は未対応の型"),
+            ("void __usercall(int a@<R0>, int b@<R1>, int c@<R2>, int d@<R3>, int e@<R4>)",
+             "5つ目以降"),
+            ("void __usercall(float a)", "引数 1 に解釈できる位置の注記がありません"),
+            ("Node __usercall@<S1:S0>()", "float 2 欄の構造体"),
+            ("Unknown __usercall@<S1:S0>()", "float 2 欄の構造体"),
+            ("int __usercall()", "戻り値の位置は R0"),
+            ("float __usercall@<R0>()", "戻り値の位置は S0"),
+            ("void __usercall@<R0>()", "void の戻り値"),
+            ("double __usercall@<S0>()", "未対応の戻り値の型"),
+            ("int __usercall@<R1>()", "戻り値の位置は R0"),
+            ("void __usercall(int *@<R0> *a@<R0>)", "未対応の型"),
+        )
+        for prototype, reason in cases:
+            with self.subTest(prototype=prototype):
+                with self.assertRaisesRegex(ValueError, "BadCall: __usercall .*" + reason):
+                    self.usercall_header("BadCall", prototype)
+                self.assertFalse((self.repo / "include/game_api.h").exists())
+
+    def test_usercall_integer_pointer_and_float_register_banks(self):
+        content = self.usercall_header(
+            "Mixed", "Mode __usercall@<R0>(bool a@<R0>, float b@<S0>, Mode c@<R1>, "
+            "unsigned __int16 d@<R2>, float e@<S1>, const Node *f@<R3>)")
+        self.assertIn("using Mixed_t = Mode (*)(bool a, float b, Mode c, "
+                      "std::uint16_t d, float e, const Node *f);", content)
+        content = self.usercall_header("Pointer", "Node * __usercall@<R0>(void)")
+        self.assertIn("using Pointer_t = Node * (*)(void);", content)
+
+    def test_usercall_float_pair_requires_exact_definition(self):
+        for body in ("struct Pair { float x; int y; };",
+                     "struct Pair { float x; };",
+                     "struct Pair { float x; float y; float z; };",
+                     "struct Pair { float xy[2]; };",
+                     "union Pair { float x; float y; };"):
+            with self.subTest(body=body):
+                (self.symbols / "types/pair.h").write_text("// type: Pair\n" + body, encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "BadPair: .*float 2 欄の構造体"):
+                    self.usercall_header("BadPair", "Pair __usercall@<S1:S0>()")
+                self.assertFalse((self.repo / "include/game_api.h").exists())
+
     ENUM_TYPES = (
         "// type: Mode\nenum Mode\n{\n  Mode_A = 0x0,\n  Mode_B = 0x1,\n};\n"
         "// type: Flags\nenum __bitmask Flags\n{\n  Flags_X = 0x1,\n  Flags_Y = 0x2,\n};\n"
