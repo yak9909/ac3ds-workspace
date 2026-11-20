@@ -38,12 +38,22 @@ def test_export_copy_unlock_command_and_state(tmp_path, monkeypatch):
         assert not locked
         assert (c.data / "builds" / "one" / "ida" / "export-work" / "one.i64").read_bytes() == b"canonical"
         calls.append(args)
+        out = Path(args[args.index("--out") + 1])
+        out.mkdir(exist_ok=True)
+        (out / "index.txt").write_text(
+            "生成物。編集しない\nsymbols_commit: abc\nidb_input_sha256: hash\n"
+            "name\taddress\tfile\tdecompile\tsymbols_commit\n"
+            "foo\t0x00100000\tfoo.txt\tok\tabc\n", encoding="utf-8")
+        (out / "foo.txt").write_text("生成物。編集しない\n0x00100000 foo\n", encoding="utf-8")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
     monkeypatch.setattr(orch, "FileLock", Lock)
     monkeypatch.setattr(orch.subprocess, "run", launch)
     monkeypatch.setattr(orch, "tool_env", lambda _: {})
     first = orch.run_export(c, "one", commit="abc")
     second = orch.run_export(c, "one", ["foo", "bar"], commit="def")
+    out = c.data / "builds" / "one" / "export"
+    assert (out / "xrefs.tsv").is_file() and (out / "all_functions.txt").is_file()
+    assert "===== 0x00100000 foo =====" in (out / "all_functions.txt").read_text(encoding="utf-8")
     assert first["mode"] == "full" and second["mode"] == "partial"
     assert second["full_at"] == first["full_at"]
     assert calls[0][1].endswith("export_all.py")
@@ -192,3 +202,37 @@ def test_dispatch_export_line(tmp_path, monkeypatch):
     (c.state / "export.json").write_text(json.dumps({"builds": {"one": {"commit": "old"}}}), encoding="utf-8")
     monkeypatch.setattr(orch, "git_ok", lambda *_: True)
     assert "書き出しは old 時点。以後に変わった名前は symbols を見る" in orch.dispatch_export_line(c, "one")
+
+
+def test_export_index_only(tmp_path, monkeypatch):
+    c = context(tmp_path)
+    out = c.data / "builds" / "one" / "export"
+    out.mkdir()
+    (out / "index.txt").write_text(
+        "生成物。編集しない\nsymbols_commit: abc\nidb_input_sha256: hash\n"
+        "name\taddress\tfile\tdecompile\tsymbols_commit\n", encoding="utf-8")
+    monkeypatch.setattr(orch, "Ctx", lambda: c)
+    def unexpected(*args, **kwargs):
+        raise AssertionError("IDA/git must not run")
+    monkeypatch.setattr(orch.subprocess, "run", unexpected)
+    monkeypatch.setattr(orch, "run_export", unexpected)
+    monkeypatch.setattr(orch, "git", unexpected)
+    assert orch.main(["export", "--index-only", "--build", "one"]) == 0
+    assert (out / "xrefs.tsv").is_file() and (out / "all_functions.txt").is_file()
+
+
+def test_dispatch_export_search_guidance(tmp_path, monkeypatch):
+    c = context(tmp_path)
+    c.local["rg"] = "C:/Tools/ripgrep/rg.exe"
+    out = c.data / "builds" / "one" / "export"
+    out.mkdir()
+    for name in ("index.txt", "xrefs.tsv", "all_functions.txt"):
+        (out / name).write_text("", encoding="utf-8")
+    monkeypatch.setattr(orch, "export_state", lambda _: {"builds": {"one": {"commit": "abc"}}})
+    monkeypatch.setattr(orch, "load_tasks", lambda _: {})
+    line = orch.dispatch_export_line(c, "one")
+    assert all(word in line for word in ("xrefs.tsv", "all_functions.txt", c.local["rg"], "形の上の推定", "Select-String"))
+    c.local.pop("rg")
+    assert "実行: rg" in orch.dispatch_export_line(c, "one")
+    (out / "xrefs.tsv").unlink()
+    assert "xrefs.tsv" not in orch.dispatch_export_line(c, "one")
