@@ -217,6 +217,8 @@ C1・C2 は細部が落ちたり読む回数が増えたりする恐れがあり
 - 正本の IDB には、合格した symbols の差分だけを取り込みます。作業はタスクごとのコピーで行います。正本は、照合済みの code.bin から作り、symbols を取り込んだ物です。
 - symbols は IDA と Ghidra で共有します。
 - **全関数の書き出し**は `_local/builds/<ビルド>/export/` にあり、IDB を開かずに関数を読むための物です。名前や型の取り込みの後、解析の作業の前に作り直します（`orch.py export`）。
+- 書き出しのデータ参照は `xrefs.tsv`、全文検索は `all_functions.txt` を ripgrep（`rg`、`workspace.local.toml` に `rg` があればその実行パス）で検索します。関数ファイルを 1 つずつ開く検索（`Select-String`・`Get-ChildItem -Recurse`）はしません。
+- `xrefs.tsv` の `kinds`（write・read・ref）は形の上の推定です。確かめは関数を読みます。`orch.py export --index-only [--build <ビルド>]` で IDA を動かさず 2 ファイルを作り直せます。
 - **復元の試験**（空の IDB に symbols を取り込んで正本と比べる。`ac3ds-re/tools/sync/restore_test.py`）で、IDB を symbols から作り直せることを確かめます。
 
 ## 12. Git と公開

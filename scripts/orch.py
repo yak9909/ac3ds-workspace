@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import audit  # noqa: E402
 import capacity  # noqa: E402
 import export_game_api  # noqa: E402
+import export_index  # noqa: E402
 import usage_watch  # noqa: E402
 import sync_skills  # noqa: E402
 import wslib  # noqa: E402
@@ -599,6 +600,7 @@ def run_export(c: Ctx, build: str, only: list[str] | None = None, commit: str | 
                        text=True, encoding="utf-8", errors="replace")
     if r.returncode:
         raise OrchError("書き出し失敗(%s): %s" % (build, (r.stderr or r.stdout).strip()[-500:]))
+    rebuild_export_indexes(out)
     elapsed = round(time.monotonic() - started, 3)
     with FileLock(str(c.state / "export.json.lock"), timeout=30):
         state = export_state(c)
@@ -614,9 +616,21 @@ def run_export(c: Ctx, build: str, only: list[str] | None = None, commit: str | 
     return entry
 
 
+def rebuild_export_indexes(out: Path) -> dict:
+    try:
+        return export_index.build_indexes(out)
+    except (OSError, ValueError, KeyError, StopIteration) as e:
+        raise OrchError("書き出しの索引を作れない: %s: %s" % (out, e)) from e
+
+
 def cmd_export(a) -> int:
     c = Ctx()
     builds = [a.build] if a.build else export_builds(c)
+    if getattr(a, "index_only", False):
+        for build in builds:
+            result = rebuild_export_indexes(c.data / "builds" / build / "export")
+            print("%s: 索引作成完了（%s 秒）" % (build, result["seconds"]))
+        return 0
     commit = git(c, c.root / DEFAULT_REPO, "rev-parse", "main").strip()
     for build in builds:
         entry = run_export(c, build, a.only, commit)
@@ -1017,6 +1031,12 @@ def dispatch_export_line(c: Ctx, build: str) -> str:
     commit = entry["commit"]
     line = "書き出し: %s（索引 index.txt、元の commit %s）" % (
         c.data / "builds" / build / "export", commit)
+    out = c.data / "builds" / build / "export"
+    if all((out / name).is_file() for name in ("xrefs.tsv", "all_functions.txt")):
+        rg = c.local.get("rg") or "rg"
+        line += ("。データの参照は xrefs.tsv、全文の検索は all_functions.txt を ripgrep（rg、実行: %s）で。"
+                 "kinds は形の上の推定。確かめは関数を読む。"
+                 "関数のファイルを 1 つずつ開く検索（Select-String・Get-ChildItem -Recurse）はしない" % rg)
     accepted = [t for t in load_tasks(c).values() if t.get("state") == "accepted"
                 and t.get("idb_import") == "取り込み済み" and build in t.get("symbols_builds", [])
                 and t.get("merge_commit")]
@@ -2698,6 +2718,7 @@ def main(argv=None) -> int:
     s = add("export", cmd_export, repo=False)
     s.add_argument("--build")
     s.add_argument("--only", nargs="+", default=[])
+    s.add_argument("--index-only", action="store_true", help="IDA を動かさず既存の書き出しの索引だけ作り直す")
     add("status", cmd_status, repo=False)
     add("stats", cmd_stats, repo=False)
     add("capacity", cmd_capacity, repo=False)
