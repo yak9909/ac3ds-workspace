@@ -1389,6 +1389,72 @@ def test_derived_issue_without_analysis_info_is_created(env):
     assert args[args.index("--repo") + 1] == "yak9909/gohan"
 
 
+# ---------- symbols の差分 ----------
+@pytest.fixture
+def symbol_repo(tmp_path):
+    repo = tmp_path / "symbols-repo"
+    repo.mkdir()
+    g(repo, "init", "-b", "main")
+    g(repo, "config", "user.name", "Test")
+    g(repo, "config", "user.email", FAKE_EMAIL)
+    folder = repo / "symbols/sample"
+    (folder / "types").mkdir(parents=True)
+    (folder / "functions").mkdir()
+    (folder / "types/local_types.h").write_text(
+        "// type: Mode\nenum Mode {\n    One = 1,\n};\n"
+        "// type: Node\nstruct Node {\n    int value;\n};\n"
+        "// type: Keep\nstruct Keep { int value; };\n", encoding="utf-8")
+    (folder / "functions/one.csv").write_text(
+        "address,name,prototype\n0x1000,old_fn,int()\n", encoding="utf-8")
+    g(repo, "add", ".")
+    g(repo, "commit", "-m", "base")
+    return repo, g(repo, "rev-parse", "HEAD").strip(), SimpleNamespace(root=repo, git=GIT, data=repo / "_local")
+
+
+@pytest.mark.parametrize("markers", [True, False])
+def test_symbols_diff_types_only_and_deep_review(symbol_repo, markers):
+    repo, base, c = symbol_repo
+    if not markers:
+        header = repo / "symbols/sample/types/local_types.h"
+        header.write_text("\n".join(line for line in header.read_text(encoding="utf-8").split("\n")
+                                    if not line.startswith("// type:")), encoding="utf-8")
+        g(repo, "add", ".")
+        g(repo, "commit", "-m", "without markers")
+        base = g(repo, "rev-parse", "HEAD").strip()
+    header = repo / "symbols/sample/types/local_types.h"
+    header.write_text(header.read_text(encoding="utf-8")
+                      .replace("One = 1,", "One = 1,\n    Two = 2,")
+                      .replace("    int value;", "    short value;")
+                      + "// type: Added\nstruct Added { int x; };\n", encoding="utf-8")
+    g(repo, "add", ".")
+    g(repo, "commit", "-m", "types only")
+    lines, builds = orch.symbols_diff(c, repo, base)
+    assert builds == ["sample"]
+    assert lines == ["- symbols/sample/types/local_types.h: ファイル変更"]
+    names = orch.changed_symbol_names(c, repo, base)
+    assert {"Mode", "Node", "Added"} <= names
+    assert "Keep" not in names
+    (repo / "product/spec").mkdir(parents=True)
+    (repo / "product/spec/game_api.toml").write_text(
+        'types = ["Mode", "Node", "Added", "Keep"]\n', encoding="utf-8")
+    c.repos = lambda: {"product": {"role": "derived"}}
+    assert orch.deep_review_hits(c, names) == {"product": ["Added", "Mode", "Node"]}
+
+
+def test_symbols_diff_csv_summary_unchanged(symbol_repo):
+    repo, base, c = symbol_repo
+    path = repo / "symbols/sample/functions/one.csv"
+    path.write_text("address,name,prototype\n0x1000,new_fn,void()\n"
+                    "0x2000,added_fn,int()\n", encoding="utf-8")
+    g(repo, "add", ".")
+    g(repo, "commit", "-m", "csv")
+    assert orch.symbols_diff(c, repo, base) == ([
+        "- symbols/sample/functions/one.csv: 追加 1・削除 0・変更 1（名前 1・型 1）",
+        "    + 0x2000 added_fn",
+        "    ~ 0x1000 name: old_fn -> new_fn; prototype: int() -> void()",
+    ], ["sample"])
+
+
 # ---------- 深い検証の要否（stamp・accept）----------
 def base_symbols(ws):
     """main に symbols の基準を入れる（作業の差分で名前・型の変更を作るため）。"""

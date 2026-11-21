@@ -81,6 +81,26 @@ class ExportGameApiTests(unittest.TestCase):
         self.assertNotIn("symbols\\sample", content)
         self.assertTrue(stderr.write.called)
 
+    def test_cpp_keyword_argument_names(self):
+        self.assertIn("this", api.CPP_KEYWORDS)
+        for before, after in [
+            ("void *this", "void *self"),
+            ("int class", "int class_"),
+            ("int template", "int template_"),
+            ("void *int", "void *int_"),
+            ("int int", "int int_"),
+            ("Node *node", "Node *node"),
+            ("unsigned int, const Node *", "unsigned int, const Node *"),
+            ("void (*this)(int)", "void (*self)(int)"),
+        ]:
+            with self.subTest(argument=before):
+                path = self.symbols / "functions/00100000.csv"
+                self.write_csv(path, ["address", "size", "name", "prototype"],
+                               [["0x00123457", "4", "ThumbFunc", f"int __fastcall({before})"]])
+                self.config(functions='["ThumbFunc"]')
+                content = api.generate(self.repo).read_text(encoding="utf-8")
+                self.assertIn(f"using ThumbFunc_t = int (*)({after});", content)
+
     def test_unknown_function_is_error_and_does_not_write(self):
         self.config(functions='["Missing"]')
         with self.assertRaisesRegex(ValueError, "見つからない関数: Missing"):

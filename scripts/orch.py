@@ -1880,7 +1880,7 @@ def cmd_review(a) -> int:
 # ---------- stamp ----------
 def symbols_diff(c: Ctx, wt: Path, base: str):
     names = [n for n in git(c, wt, "diff", "--name-only", base + "...HEAD", "--", "symbols").splitlines()
-             if n.endswith(".csv")]
+             if len(n.split("/")) >= 3]
     lines: list[str] = []
     builds: set[str] = set()
 
@@ -1893,6 +1893,9 @@ def symbols_diff(c: Ctx, wt: Path, base: str):
 
     for n in names:
         builds.add(n.split("/")[1])
+        if not n.endswith(".csv"):
+            lines.append("- %s: ファイル変更" % n)
+            continue
         old = rows(git(c, wt, "show", "%s:%s" % (base, n), check=False))
         new = rows(git(c, wt, "show", "HEAD:" + n, check=False))
         add = [k for k in new if k not in old]
@@ -1928,7 +1931,7 @@ def symbol_rows(c: Ctx, wt: Path, rev: str, path: str) -> dict:
 
 def changed_symbol_names(c: Ctx, wt: Path, base: str) -> set[str]:
     """深い検証の判断に使う、symbols の変更の名前。functions・globals は名前か型（prototype・type）が変わった行の
-    名前（旧名と新名）、types は変更行にある識別子（C の予約語を除く）。"""
+    名前（旧名と新名）、types は変更行の識別子と本体が変わった型名（C++ の予約語を除く）。"""
     names: set[str] = set()
     for path in git(c, wt, "diff", "--name-only", base + "...HEAD", "--", "symbols").splitlines():
         parts = path.split("/")
@@ -1942,6 +1945,21 @@ def changed_symbol_names(c: Ctx, wt: Path, base: str) -> set[str]:
                 if n and any(o.get(k) != n.get(k) for k in ("name", "prototype", "type")):
                     names.update(x for x in (o.get("name"), n.get("name")) if x)
         elif kind == "types":
+            # 値・メンバーだけの変更でも、宣言行が差分に出ない型の名前を拾う。
+            def type_blocks(rev):
+                source = git(c, wt, "show", "%s:%s" % (rev, path), check=False)
+                starts = list(export_game_api.TYPE_MARKER.finditer(source))
+                marked = {m.group(1) for m in starts}
+                starts += [m for m in re.finditer(
+                    r"^\s*(?:typedef\s+)?(?:struct|class|union|enum)\s+([A-Za-z_]\w*)",
+                    source, re.M) if m.group(1) not in marked]
+                starts.sort(key=lambda m: m.start())
+                return {m.group(1): source[m.start():starts[i + 1].start()
+                        if i + 1 < len(starts) else len(source)]
+                        for i, m in enumerate(starts)}
+
+            old, new = type_blocks(base), type_blocks("HEAD")
+            names.update(n for n in old.keys() | new.keys() if old.get(n) != new.get(n))
             for line in git(c, wt, "diff", "-U0", base + "...HEAD", "--", path).splitlines():
                 if line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
                     names.update(re.findall(r"[A-Za-z_][A-Za-z_0-9]*", line[1:]))
