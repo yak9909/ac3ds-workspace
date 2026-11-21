@@ -373,10 +373,28 @@ def function_lines(name: str, row: dict[str, str],
         return ["// プロトタイプ未設定",
                 f"inline constexpr std::uintptr_t {name}_addr = {addr};"]
     prototype = cpp_syntax(prototype).strip()
+    # 引数名の予約語は this -> self、それ以外は末尾に _。型の予約語はそのまま。
+    type_words = set("void bool char char16_t char32_t wchar_t short int long float double "
+                     "signed unsigned const volatile auto".split())
+
+    def argument_name(match):
+        word = match.group(2)
+        prefix = arguments[:match.start(2)].rsplit(",", 1)[-1].rsplit("(", 1)[-1]
+        # unsigned int や int const のような名前の無い型と、void *int の引数名を区別する。
+        typed = ("*" in prefix or "&" in prefix or
+                 bool(set(WORDS.findall(prefix)) - {
+                     "signed", "unsigned", "short", "long", "const", "volatile"}))
+        is_name = word not in type_words or (typed and word not in {"const", "volatile"})
+        if word in CPP_KEYWORDS and is_name:
+            word = "self" if word == "this" else word + "_"
+        return match.group(1) + word
+
     match = re.fullmatch(r"(.+?)\s*\((.*)\)", prototype, re.S)
     if not match:
         raise ValueError(f"解釈できないプロトタイプ: {name}")
     result, arguments = match.groups()
+    arguments = re.sub(r"([\s*&])([A-Za-z_]\w*)(?=\s*(?:[,\)\[]|$))",
+                       argument_name, arguments)
     if re.search(r"\b__usercall\b", prototype):
         result, arguments = normalize_usercall(name, result, arguments, definitions or {})
     return [f"using {name}_t = {result.strip()} (*)({arguments.strip()});",
