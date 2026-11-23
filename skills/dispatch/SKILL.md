@@ -25,6 +25,15 @@ description: 司令塔がワーカーに作業を依頼するとき・再試行�
   - 手で止める時は、起動したバックグラウンドのシェルを止める。ワーカーが裏で起動した試験は残ることがあるので確かめる。
 - 旧記録の作業（「?」の記録の再解析・消化）は、利用枠の3割までにする。
 
+### codex-bridge のワーカー
+
+- codex-bridge（MCP の道具 `mcp__codex-bridge__*`）は、貸す人の PC の Codex に、この PC の共有フォルダで作業させる。どの貸す人・モデルを使うかは利用者がその都度指示する。
+- 流れ: `orch.py issue`・`dispatch`（今までどおり）→ `send_task(lender=…, model=…, effort=…, prompt=依頼文)` → 終わりの知らせ → `get_result` の報告をファイルにして `orch.py report <Issue> --from <ファイル>` → `save`・`stamp`・`verify`。直しは `send_task(continue_task_id=…)`。
+- 貸す人の Codex は作業ツリーで起動しないので、依頼文の先頭に作業ツリーの絶対パスと「最初に `<作業ツリー>/AGENTS.md` を読む」を書く。パスは全部絶対パス。依頼文が作業ツリーの外のファイルを指す時は、共有フォルダの中（`_local/worktrees` の下で、作業ツリーの外）に置く。
+- `orch.py` が面倒を見ない物: 枠（`list_lenders`・`get_usage` で見る）、ワーカーの Git への書き込みの検出（`stamp` の前に司令塔が `git status`・`git log` を見る）。
+- 作業場の作業ツリー（`orch.py ws add`）には本体の `ac3ds-re` へのジャンクションがあるので、出す前にそのパスを codex-bridge で「見せない」にし、片付けの時に外す。
+- コマンド実行の承認待ちの知らせは、自分が出したタスクの物だけ判断する。
+
 ## 依頼文
 
 - 雛形は `templates/dispatch.md`（派生リポジトリは `templates/dispatch-derived.md`）。`orch.py dispatch` が作る。
